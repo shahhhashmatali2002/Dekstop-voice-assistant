@@ -382,3 +382,13 @@ def test_null_tts_says_nothing_for_empty_text():
 def test_pcm_chunk_reports_its_duration():
     chunk = PcmChunk(np.zeros(2400, dtype=DTYPE), 24000)
     assert chunk.duration_ms == pytest.approx(100.0)
+
+
+def test_get_secret_loads_from_env_file(tmp_path, monkeypatch):
+    from app.models.config import get_secret
+    env_file = tmp_path / ".env"
+    env_file.write_text("TEST_SECRET_KEY=secret_val_123\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TEST_SECRET_KEY", raising=False)
+    assert get_secret("TEST_SECRET_KEY") == "secret_val_123"
+

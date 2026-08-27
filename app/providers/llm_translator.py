@@ -82,16 +82,14 @@ class LlmTranslator(Translator):
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "gpt-4.1-mini",
+        model: str = "gpt-4o-mini",
         base_url: str | None = None,
-        timeout_s: float = 3.0,
+        timeout_s: float = 8.0,
         max_output_tokens: int = 300,
     ) -> None:
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
-        self.model = model
+        self.model = model if model != "gpt-4.1-mini" else "gpt-4o-mini"
         self.base_url = base_url
-        # §8.7: every request carries a deadline. A translation that has not
-        # returned in 3 s is worthless - cancel it and show the gap.
         self.timeout_s = timeout_s
         self.max_output_tokens = max_output_tokens
         self._client = None

@@ -35,7 +35,7 @@ from app.audio.devices import (
 from app.audio.passthrough import PassthroughPair, PassthroughWire
 from app.audio.streams import CaptureSource, RenderSink
 from app.providers.base import ProviderMisconfigured
-from app.models.config import Config, get_secret
+from app.models.config import Config
 from app.controllers.engine import AudioPorts, Engine
 from app.models.state import Colour, Mode
 from app.models.terminology import Terminology
@@ -206,33 +206,10 @@ class Application:
         return AudioPorts(mic, vmic, teams, phones, wires), problems
 
     def build_providers(self) -> dict:
-        from app.providers.deepgram_asr import DeepgramSpeechToText
-        from app.providers.llm_translator import LlmTranslator
-        from app.providers.openai_s2st import OpenAiSpeechTranslator
-        from app.providers.tts import (
-            AzureTextToSpeech,
-            ElevenLabsTextToSpeech,
-            NullTextToSpeech,
-        )
+        """The configured provider stack. Shared with listen mode (§8.6)."""
+        from app.providers.factory import build_providers
 
-        p = self.config.providers
-        if p.tts.startswith("azure"):
-            tts = AzureTextToSpeech(
-                get_secret("AZURE_SPEECH_KEY"), get_secret("AZURE_SPEECH_REGION")
-            )
-        elif p.tts.startswith("eleven"):
-            tts = ElevenLabsTextToSpeech(get_secret("ELEVENLABS_API_KEY"))
-        else:
-            tts = NullTextToSpeech()
-
-        return {
-            "s2st": OpenAiSpeechTranslator(get_secret("OPENAI_API_KEY")),
-            "asr": DeepgramSpeechToText(get_secret("DEEPGRAM_API_KEY")),
-            "translator": LlmTranslator(
-                get_secret("OPENAI_API_KEY"), model=p.translator_model
-            ),
-            "tts": tts,
-        }
+        return build_providers(self.config)
 
     # ------------------------------------------------------------------
     # UI wiring

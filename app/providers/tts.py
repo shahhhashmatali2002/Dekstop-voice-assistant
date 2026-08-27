@@ -256,3 +256,49 @@ class NullTextToSpeech(TextToSpeech):
             yield PcmChunk(np.zeros(n, dtype=DTYPE), self.rate)
             emitted += n
         yield PcmChunk(np.empty(0, dtype=DTYPE), self.rate, final=True)
+
+
+# ----------------------------------------------------------------------
+
+
+class EdgeTextToSpeech(TextToSpeech):
+    """Free Neural TTS synthesis via Edge TTS (Microsoft Neural Voices)."""
+
+    name = "edge-tts"
+
+    def __init__(self, rate: int = 24_000) -> None:
+        self.rate = rate
+
+    async def synthesize(
+        self, text: str, voice: VoiceId
+    ) -> AsyncIterator[PcmChunk]:
+        if not text.strip():
+            return
+        try:
+            import edge_tts
+            import miniaudio
+        except ImportError as exc:
+            raise ProviderMisconfigured("pip install edge-tts miniaudio") from exc
+
+        voice_name = voice.name if (voice and voice.name and voice.name != "azure") else "ur-PK-UzmaNeural"
+        try:
+            comm = edge_tts.Communicate(text, voice_name)
+            mp3 = b""
+            async for chunk in comm.stream():
+                if chunk["type"] == "audio":
+                    mp3 += chunk["data"]
+            if not mp3:
+                return
+            decoded = miniaudio.decode(mp3, nchannels=1, sample_rate=self.rate)
+            samples = np.frombuffer(decoded.samples, dtype=DTYPE)
+
+            chunk_size = self.rate // 5
+            for i in range(0, len(samples), chunk_size):
+                await asyncio.sleep(0)
+                yield PcmChunk(samples[i : i + chunk_size], self.rate)
+            yield PcmChunk(np.empty(0, dtype=DTYPE), self.rate, final=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ProviderUnavailable(f"Edge TTS failed: {exc}") from exc
+

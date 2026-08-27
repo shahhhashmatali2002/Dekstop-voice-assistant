@@ -14,7 +14,8 @@ audio endpoints it is pointed at.
 
 ```
 VoiceAssistant/
-├── run.py                  <- start here
+├── run.py                  <- meeting mode: two way, Teams
+├── listen.py               <- listen mode: one way, any application
 ├── requirements.txt
 ├── app/
 │   ├── models/             state, config, terminology, telemetry
@@ -81,6 +82,95 @@ report its problems only to a console nobody is watching.
 
 ---
 
+---
+
+## Listen mode: hear anything in Urdu
+
+`listen.py` is the second entry point and the one way round. No microphone, no
+second cable, nothing that knows what Teams is. Whatever an application is
+playing in English comes out of your headphones in Urdu — and the English does
+not.
+
+```
+    YouTube, a Teams call, a recording, anything
+        |
+        |  Windows per-application output routing
+        v
+    CABLE Input            a virtual cable nobody is listening to
+        |
+        |  WASAPI loopback capture
+        v
+    [ passthrough wire ] --------------------------> headphones
+        |                                            (before Start)
+        +--> VAD -> English ASR -> segmentation
+                 -> translation -> Urdu TTS --------> headphones
+                                                     (after Start)
+```
+
+### One-time setup
+
+1. Install **VB-CABLE** (vb-audio.com/Cable) and reboot.
+2. Tell the tool which cable it is:
+
+   ```powershell
+   python listen.py --source "CABLE Input" --save
+   ```
+
+3. Route **only** the application you want translated:
+
+   *Settings › System › Sound › Volume mixer › Chrome (or Teams) › Output
+   device › CABLE Input*
+
+Your headphones stay the Windows default, so every other application still
+sounds exactly as it did. Nothing about the source application is modified and
+it never knows we exist — the same principle as meeting mode, one endpoint
+further out.
+
+### Run it
+
+```powershell
+python listen.py                  # the window: Start, Pause, Subtitles
+python listen.py --console        # no interface; starts at once, Ctrl+C quits
+python listen.py --devices        # the playback endpoints you can route to
+python listen.py --check          # install, devices, API keys
+python listen.py --allow-capture  # let the windows appear in screenshots
+```
+
+Both windows are excluded from screen capture (§2.4), so a screenshot, the
+Snipping Tool, OBS and a Teams share all see straight through them — the
+window is simply absent, which is correct for a live transcript of the other
+person's words and confusing the first time you try to photograph your own
+tool. `--allow-capture` waives it for one run and is never saved.
+
+Before Start, the cable is pumped straight to your headphones and you hear the
+original English. Start mutes that wire and the Urdu takes over the same sink.
+Stop, Pause, and every provider failure unmute it again: **you are never left
+in silence** — §2.5, unchanged.
+
+Exactly one thing reads the capture ring at a time, the wire or the pipeline,
+because a ring read is destructive. That is the invariant `tests/test_listen.py`
+spends most of its length on.
+
+### Why the virtual cable is not optional
+
+What we capture *is* the render stream of the endpoint we capture from, so
+muting that endpoint mutes our own input along with it. There is no gain
+setting that takes the English out of your ears and leaves it in ours.
+
+The one mechanism that separates them is **process loopback** (§5.2 / D7):
+capture a chosen process's audio whether or not it is being rendered anywhere.
+PyAudioWPatch does not expose it, so until that is built the source application
+has to render into a cable nobody hears.
+
+### What to expect
+
+Two to four seconds behind the speaker, dominated by endpointing (§9.3, tune
+with `tools/replay.py --sweep stability`). On a video the picture runs ahead of
+the Urdu; the subtitle window shows the English and the Urdu as each arrives so
+you can follow the gap. In a live call that lag is the price of the cascade —
+Urdu is not an available output language for any speech-to-speech model (§8.2),
+so there is nothing faster to switch to.
+
 ## What is built
 
 | Layer | Verified? |
@@ -92,8 +182,9 @@ report its problems only to a console nobody is watching.
 | `app/audio` devices, streams, passthrough | ⚠️ **never executed — needs Windows** |
 | `app/views` | renders correctly; focus and capture behaviour **need Windows** |
 | `app/controllers/engine` + `main` | ⚠️ **never executed end to end** |
+| `listen.py` + `app/controllers/listen` | tested, incl. English-in / Urdu-out end to end against fake providers — **real devices and real providers not exercised** |
 
-**152 tests pass:** `pytest`
+**222 tests pass:** `pytest`
 
 ---
 
@@ -220,9 +311,23 @@ defeats the whole measure. Verify from the far side of a real call, per build.
 - **Device pinning is by name, not endpoint ID.** PortAudio does not expose
   the Windows endpoint ID; `pycaw` does. Phase 6.
 - **Process loopback is deferred** (§5.2 / D7). Endpoint loopback on a virtual
-  speaker is the v1 design.
+  speaker is the v1 design, and it is what makes the virtual cable mandatory
+  in listen mode.
+- **`pipeline.original_mix_db` is still not implemented.** Mixing a little of
+  the original underneath the Urdu needs a *summing* sink: the render sink is
+  a ring buffer, so two writers interleave rather than add, and a second
+  reader of the capture ring would starve the first. The setting is honoured
+  nowhere, and listen mode deliberately does not pretend otherwise.
 
 ## Next
 
 Phase 0 on real hardware, then the evaluation set. Everything else waits on
 those two.
+
+**Listen mode is the cheapest way to do the first one.** It needs one cable
+instead of two, no microphone, and no outgoing pipeline, and it exercises the
+same capture, ring, conversion and render code the meeting mode depends on.
+If `python listen.py --console` translates a YouTube video into your
+headphones without a click, the audio spine is sound and the remaining risk
+is recognition quality — which is what `tools/bench_asr.py` and the
+evaluation set are for.

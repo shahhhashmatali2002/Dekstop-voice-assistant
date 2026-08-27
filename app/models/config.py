@@ -40,7 +40,7 @@ class ProviderConfig:
     translator: str = "llm-translator"
     tts: str = "azure-neural-tts"
     urdu_voice: str = "ur-PK-UzmaNeural"
-    translator_model: str = "gpt-4.1-mini"
+    translator_model: str = "gpt-4o-mini"
     region: str = ""
 
 
@@ -58,6 +58,32 @@ class PipelineConfig:
     #: 0.0 = the consultant hears only Urdu, which is the brief. A small
     #: negative value mixes the original back in for turn-taking cues (§18 O4).
     original_mix_db: float | None = None
+
+
+@dataclass
+class ListenConfig:
+    """Listen mode: one way, any application, no microphone.
+
+    A separate topology from the meeting mode above, and deliberately a
+    separate section: it needs one cable rather than two and no microphone at
+    all, so reusing `DeviceConfig` here would mean four fields of which two
+    are always blank.
+
+    `source` is the *render* endpoint the source application is pointed at -
+    "CABLE Input" - not its loopback twin. We ask Windows for the loopback of
+    that endpoint at open time, because the loopback endpoint is named after
+    its render device and is the thing the user cannot pick from a list of
+    playback devices.
+
+    `output` is where the Urdu goes. Blank means whatever Windows is using,
+    which is the right default: it is the device the user is wearing.
+    """
+
+    source: str = ""
+    output: str = ""
+    #: Start translating as soon as the window opens, rather than waiting for
+    #: Start. Convenient once the routing is set up and never changes.
+    autostart: bool = False
 
 
 @dataclass
@@ -79,6 +105,7 @@ class Config:
     devices: DeviceConfig = field(default_factory=DeviceConfig)
     providers: ProviderConfig = field(default_factory=ProviderConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
+    listen: ListenConfig = field(default_factory=ListenConfig)
     ui: UiConfig = field(default_factory=UiConfig)
     setup_complete: bool = False
 
@@ -103,6 +130,7 @@ class Config:
             devices=DeviceConfig(**data.get("devices", {})),
             providers=ProviderConfig(**data.get("providers", {})),
             pipeline=PipelineConfig(**data.get("pipeline", {})),
+            listen=ListenConfig(**data.get("listen", {})),
             ui=UiConfig(**data.get("ui", {})),
             setup_complete=bool(data.get("setup_complete", False)),
         )
@@ -119,6 +147,24 @@ class Config:
 # ----------------------------------------------------------------------
 
 
+def _load_env_file() -> None:
+    for base_dir in (Path.cwd(), Path(__file__).resolve().parent.parent.parent):
+        env_path = base_dir / ".env"
+        if env_path.is_file():
+            try:
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+            except Exception:
+                pass
+
+
 def get_secret(name: str) -> str:
     """Read a credential. Credential Manager first, environment as fallback.
 
@@ -133,6 +179,8 @@ def get_secret(name: str) -> str:
             return value
     except Exception:
         pass
+    if name not in os.environ:
+        _load_env_file()
     return os.environ.get(name, "")
 
 
