@@ -184,8 +184,9 @@ class OpenAiSpeechTranslator(SpeechTranslator):
     output_languages = OUTPUT_LANGUAGES
 
     def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL) -> None:
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self.api_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY", "")
         self.model = model
+
 
     async def open(self, cfg: S2stConfig) -> S2stStream:
         if not self.api_key:
@@ -196,10 +197,13 @@ class OpenAiSpeechTranslator(SpeechTranslator):
                 f"Supported outputs: {', '.join(self.output_languages)}. "
                 "Urdu output must use the cascade path (§8.2)."
             )
+        if not self.api_key:
+            raise ProviderMisconfigured("OPENAI_API_KEY is not set")
         try:
             import websockets
         except ImportError as exc:  # pragma: no cover
             raise ProviderMisconfigured("pip install websockets") from exc
+
 
         url = f"{ENDPOINT}?model={cfg.model or self.model}"
         headers = {

@@ -46,18 +46,17 @@ class ProviderConfig:
 
 @dataclass
 class PipelineConfig:
-    """The three settings that dominate TTFTA. Tune against recordings (§9.3)."""
+    """The settings that dominate TTFTA and stability."""
 
-    vad_hangover_ms: float = 400.0
+    vad_hangover_ms: float = 350.0
     vad_preroll_ms: float = 250.0
     stability_hypotheses: int = 3
-    stability_ms: float = 350.0
+    stability_ms: float = 300.0
     max_words: int = 12
     barge_in_confirm_ms: float = 250.0
     suppress_backchannels: bool = True
-    #: 0.0 = the consultant hears only Urdu, which is the brief. A small
-    #: negative value mixes the original back in for turn-taking cues (§18 O4).
     original_mix_db: float | None = None
+
 
 
 @dataclass

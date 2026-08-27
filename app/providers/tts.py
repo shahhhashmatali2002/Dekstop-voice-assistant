@@ -296,8 +296,9 @@ class EdgeTextToSpeech(TextToSpeech):
             for i in range(0, len(samples), chunk_size):
                 chunk_pcm = samples[i : i + chunk_size]
                 yield PcmChunk(chunk_pcm, self.rate)
-                await asyncio.sleep(len(chunk_pcm) / self.rate)
+                await asyncio.sleep(0.005)
             yield PcmChunk(np.empty(0, dtype=DTYPE), self.rate, final=True)
+
         except asyncio.CancelledError:
             raise
         except Exception as exc:

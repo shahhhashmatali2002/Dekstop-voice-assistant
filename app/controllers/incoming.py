@@ -144,15 +144,19 @@ class IncomingPipeline:
                 res = self.gate.push(frame)
 
                 if res.event is SpeechEvent.ONSET:
+                    self.segmenter.reset()
                     self._speaking_trace = self.traces.new(Direction.INCOMING)
                     self._speaking_trace.mark("frame_sent")
 
-                if res.audio is not None and self._stream is not None:
+
+                if self._stream is not None:
+                    audio_frame = res.audio if res.audio is not None else frame
                     try:
-                        await self._stream.push_audio(res.audio)
+                        await self._stream.push_audio(audio_frame)
                     except ProviderError as exc:
                         await self._degrade(f"recognition: {exc}")
                         return
+
 
                 if res.event is SpeechEvent.OFFSET:
                     for unit in self.segmenter.flush():
@@ -241,10 +245,14 @@ class IncomingPipeline:
                     pcm = convert.to_channels(pcm, self.sink.channels)
                 if self._ducked:
                     pcm = convert.apply_gain_db(pcm, -20.0)
+                if hasattr(self.sink, "ring"):
+                    while self.sink.ring.free < pcm.size:
+                        await asyncio.sleep(0.015)
                 self.sink.write(pcm)
                 if first:
                     trace.mark("playback_start")
                     first = False
+
         except asyncio.CancelledError:
             raise
         except ProviderError as exc:

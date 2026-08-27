@@ -221,8 +221,8 @@ class Segmenter:
             rest = self._remainder(text)
             if rest:
                 units.append(Unit(rest, "final", hyp.at, hyp.speaker))
-                self._emitted = text
-            self.reset()
+                self._emitted = (self._emitted + " " + rest).strip()
+            self.stability.reset()
             return units
 
         stable = self.stability.update(text, hyp.at)
@@ -259,10 +259,12 @@ class Segmenter:
         """
         held = self.stability.latest.strip()
         rest = self._remainder(held)
-        self.reset()
         if rest and len(rest.split()) >= 1:
+            self._emitted = (self._emitted + " " + rest).strip()
+            self.stability.reset()
             return [Unit(rest, reason)]
         return []
+
 
     # ------------------------------------------------------------------
 
@@ -270,11 +272,24 @@ class Segmenter:
         """The part of `text` beyond what has already been emitted."""
         if not text:
             return ""
+        text_clean = text.strip()
         if not self._emitted:
-            return text.strip()
-        if text.startswith(self._emitted):
-            return text[len(self._emitted):].strip()
-        # The recogniser revised text we have already spoken. We cannot take it
-        # back, so we keep our version and only take what is genuinely new.
-        common = _common_prefix(self._emitted, text)
-        return text[len(common):].strip()
+            return text_clean
+        emitted_clean = self._emitted.strip()
+
+        t_norm = text_clean.rstrip(".!?;:۔؟…").lower()
+        e_norm = emitted_clean.rstrip(".!?;:۔؟…").lower()
+
+        if t_norm == e_norm or t_norm.endswith(e_norm) or e_norm.endswith(t_norm):
+            return ""
+        if text_clean.startswith(emitted_clean):
+            return text_clean[len(emitted_clean):].strip()
+        if e_norm and t_norm.startswith(e_norm):
+            return text_clean[len(emitted_clean):].strip()
+
+        common = _common_prefix(emitted_clean, text_clean)
+        rem = text_clean[len(common):].strip()
+        if rem.lower().rstrip(".!?;:۔؟…") == t_norm:
+            return ""
+        return rem
+
