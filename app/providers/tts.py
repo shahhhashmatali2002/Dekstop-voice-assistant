@@ -294,11 +294,13 @@ class EdgeTextToSpeech(TextToSpeech):
 
             chunk_size = self.rate // 5
             for i in range(0, len(samples), chunk_size):
-                await asyncio.sleep(0)
-                yield PcmChunk(samples[i : i + chunk_size], self.rate)
+                chunk_pcm = samples[i : i + chunk_size]
+                yield PcmChunk(chunk_pcm, self.rate)
+                await asyncio.sleep(len(chunk_pcm) / self.rate)
             yield PcmChunk(np.empty(0, dtype=DTYPE), self.rate, final=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             raise ProviderUnavailable(f"Edge TTS failed: {exc}") from exc
+
 
