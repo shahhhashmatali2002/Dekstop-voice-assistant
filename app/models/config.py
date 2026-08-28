@@ -109,7 +109,7 @@ class ListenConfig:
     #: something, where nothing is waiting on you, so whole thoughts spoken a
     #: few seconds late beat clipped phrases spoken sooner. See PRESETS in
     #: app/controllers/listen.py.
-    preset: str = "fluent"
+    preset: str = "balanced"
     #: Start translating as soon as the window opens, rather than waiting for
     #: Start. Convenient once the routing is set up and never changes.
     autostart: bool = False
@@ -135,6 +135,11 @@ class Config:
     providers: ProviderConfig = field(default_factory=ProviderConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     listen: ListenConfig = field(default_factory=ListenConfig)
+    #: What is being translated. "video" is one way - something is playing and
+    #: you want to understand it - and needs one cable and no microphone.
+    #: "meeting" is the two-way Teams topology and needs two cables. Empty
+    #: means nobody has said yet, and the application asks once.
+    mode: str = ""
     ui: UiConfig = field(default_factory=UiConfig)
     setup_complete: bool = False
 
@@ -162,6 +167,7 @@ class Config:
             listen=ListenConfig(**data.get("listen", {})),
             ui=UiConfig(**data.get("ui", {})),
             setup_complete=bool(data.get("setup_complete", False)),
+            mode=str(data.get("mode", "")),
         )
 
     def save(self, path: str | Path | None = None) -> None:

@@ -33,6 +33,32 @@ by convenience rather than by meaning. Controllers talk to them; views never do.
 
 ---
 
+## Two modes, asked once
+
+```powershell
+python run.py --mode video      # something is playing; one cable, mic off
+python run.py --mode meeting    # a two-way Teams call; two cables, mic live
+```
+
+Without `--mode` the first run asks and remembers the answer. The two
+topologies are genuinely different and neither can be inferred:
+
+| | video | meeting |
+|---|---|---|
+| capture | the cable the app is routed to | the cable Teams outputs to |
+| play into | your speakers | your speakers |
+| microphone | **not opened** | opened, translated to English |
+| cables needed | one | two |
+| directions | EN → UR | EN → UR and UR → EN |
+
+Guessing wrong is not cosmetic: it opens a microphone nobody asked for, or
+fails to open the one a call needs. In video mode the outgoing half of the
+engine does not exist — no microphone stream, no second wire, no
+speech-to-speech provider.
+
+`listen.py` is the same topology as `--mode video` with its own small window
+instead of the bubble.
+
 ## Run it
 
 ```powershell
@@ -44,7 +70,10 @@ pip install PySide6 websockets aiohttp openai keyring
 python run.py
 ```
 
-**First run** shows only the setup window — devices from dropdowns, API keys
+**First run** configures itself where it can: your microphone and headphones
+come from whatever Windows is already using, and the two virtual cables are
+matched against the virtual endpoints on the machine. If both are found it
+saves and goes straight to the bubble. It only shows the setup window — devices from dropdowns, API keys
 straight into Windows Credential Manager. Nothing else appears, because nothing
 else can do anything yet. Cancel and the app exits.
 
@@ -58,7 +87,18 @@ microphone and speakers default to whatever Windows is already using, and a
 device you picked earlier that has since been unplugged falls back to the
 default rather than blocking startup — it says so when it does.
 
-**After setup** you get the bubble and its panel: Start and Stop.
+**The bubble always comes up.** If audio cannot start it is red and the panel
+says what is missing, with Settings inside it — no modal form in front of you.
+
+```powershell
+python run.py --allow-capture     # let every window appear in screenshots
+```
+
+Every window is excluded from screen capture by default (§2.4), which is why
+a screenshot of the bubble or the transcript comes back without them.
+`--allow-capture` waives it for one run and is never saved: a stored "off"
+would sit there quietly until the call where it matters. `listen.py` takes the
+same flag.
 
 **On Start** the live transcript opens by itself, and closes again on Stop.
 
@@ -247,7 +287,7 @@ so there is nothing faster to switch to.
 | `app/controllers/engine` + `main` | ⚠️ **never executed end to end** |
 | `listen.py` + `app/controllers/listen` | tested, incl. English-in / Urdu-out end to end against fake providers — **real devices and real providers not exercised** |
 
-**248 tests pass:** `pytest`
+**275 tests pass:** `pytest`
 
 ---
 
@@ -364,8 +404,11 @@ defeats the whole measure. Verify from the far side of a real call, per build.
 
 ## Known gaps
 
-- **The first-run wizard is not built.** Settings covers the same ground, but
-  without the step-by-step verification the spec asks for (§11.7).
+- **The first-run wizard is not built.** Startup now auto-configures instead:
+  microphone and headphones come from the Windows defaults, and the two cables
+  are matched from the virtual endpoints present, saved, and the bubble opens
+  straight away. What is missing is the step-by-step *verification* §11.7 asks
+  for - it picks, it does not prove the picks work.
 - **The debug view (Figure 12) is text-only**, via `format_debug_view`.
 - **Backchannel suppression is implemented but not wired** into the outgoing
   pipeline — the S2ST model does its own endpointing, so it needs a different

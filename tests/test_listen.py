@@ -194,8 +194,9 @@ class FakeEndpoint:
 
 
 class FakeAsrStream(AsrStream):
-    def __init__(self, texts: list[str]) -> None:
+    def __init__(self, texts: list[str], *, drop_after: int | None = None) -> None:
         self.texts = texts
+        self.drop_after = drop_after
         self.pushed: list[np.ndarray] = []
         self.closed = False
 
@@ -203,10 +204,14 @@ class FakeAsrStream(AsrStream):
         self.pushed.append(pcm)
 
     async def hypotheses(self):
-        for text in self.texts:
+        for index, text in enumerate(self.texts):
             await asyncio.sleep(0.01)
+            if self.drop_after is not None and index >= self.drop_after:
+                raise ProviderUnavailable("socket closed by the provider")
             yield TranscriptDelta(text, is_final=True)
         while True:  # a real stream stays open after its last result
+            if self.drop_after is not None:
+                raise ProviderUnavailable("socket closed by the provider")
             await asyncio.sleep(0.01)
 
     async def aclose(self) -> None:
@@ -220,17 +225,28 @@ class FakeAsrStream(AsrStream):
 class FakeAsr(SpeechToText):
     name = "fake-asr"
 
-    def __init__(self, texts: list[str] | None = None, fail: bool = False) -> None:
+    def __init__(
+        self,
+        texts: list[str] | None = None,
+        fail: bool = False,
+        *,
+        drop_after: int | None = None,
+    ) -> None:
         self.texts = texts or []
         self.fail = fail
+        self.drop_after = drop_after  # the stream dies after N hypotheses
         self.stream: FakeAsrStream | None = None
+        self.streams: list = []
         self.configs: list = []
 
     async def open(self, cfg):
         self.configs.append(cfg)
         if self.fail:
             raise ProviderUnavailable("recognition is down")
-        self.stream = FakeAsrStream(self.texts)
+        # Only the first stream drops; a reconnect gets a healthy one.
+        drop = self.drop_after if len(self.streams) == 0 else None
+        self.stream = FakeAsrStream(self.texts, drop_after=drop)
+        self.streams.append(self.stream)
         return self.stream
 
 
@@ -268,7 +284,8 @@ class FakeTts(TextToSpeech):
         yield PcmChunk(np.empty(0, dtype=np.int16), self.rate, final=True)
 
 
-def build(texts=None, *, asr_fails=False, tts_chunks=3, tts_delay=0.0, **pipeline):
+def build(texts=None, *, asr_fails=False, tts_chunks=3, tts_delay=0.0,
+          asr_drops_after=None, **pipeline):
     """An engine wired to fakes, plus the parts a test needs to inspect."""
     cfg = Config()
     cfg.listen = ListenConfig(source="CABLE Input", output="Headphones")
@@ -291,7 +308,7 @@ def build(texts=None, *, asr_fails=False, tts_chunks=3, tts_delay=0.0, **pipelin
         output_device=dev("Headphones", 2),
     )
     providers = {
-        "asr": FakeAsr(texts, fail=asr_fails),
+        "asr": FakeAsr(texts, fail=asr_fails, drop_after=asr_drops_after),
         "translator": FakeTranslator(),
         "tts": FakeTts(chunks=tts_chunks, delay=tts_delay),
     }
@@ -982,3 +999,569 @@ def test_a_retraction_is_not_spoken_backwards():
         (None, None),
         ("I think that is", False),
     ]) == ["I think that is right"]
+
+
+# ----------------------------------------------------------------------
+# time to the first word after Start
+# ----------------------------------------------------------------------
+
+
+def test_the_first_unit_is_cut_short_then_normal_length_resumes():
+    """Pressing Start mid-sentence must not feel broken.
+
+    Waiting for a whole clause to be confirmed is correct and feels like
+    nothing is happening - the listener cannot tell "working, nothing to say
+    yet" from "not working". The first unit is cut short deliberately;
+    everything after it is worth the wait it costs.
+    """
+    from app.controllers.segmenter import Hypothesis, Segmenter
+
+    line = "so today we are going to"  # six words, no clause boundary
+
+    patient = Segmenter(min_hypotheses=1, stable_ms=0.0, max_words=18)
+    assert patient.push(Hypothesis(line, False, 0.0)) == [], (
+        "normally this waits for a clause - that is the point of the setting"
+    )
+
+    hurried = Segmenter(min_hypotheses=1, stable_ms=0.0, max_words=18)
+    hurried.hurry(stable_ms=0.0, max_words=5)
+    assert hurried.push(Hypothesis(line, False, 0.0)), (
+        "the first unit after Start should not wait for a whole clause"
+    )
+    # And the hurry is over: the configured length applies again.
+    assert hurried.max_words == 18
+
+
+def test_hurrying_twice_does_not_lose_the_real_settings():
+    from app.controllers.segmenter import Segmenter
+
+    seg = Segmenter(min_hypotheses=1, stable_ms=350.0, max_words=18)
+    seg.hurry()
+    seg.hurry()          # a second Start before anything was spoken
+    seg._settle()
+    assert (seg.stability.stable_ms, seg.max_words) == (350.0, 18)
+
+
+def test_synthesis_is_audible_before_the_sentence_is_finished():
+    """Edge TTS streams MP3 while it is still generating.
+
+    Collecting every chunk and decoding once at the end throws that away: a
+    five-second sentence becomes five seconds of silence followed by five
+    seconds of speech, and time-to-first-sound becomes the length of the
+    sentence instead of the length of a network round trip.
+    """
+    import asyncio as aio
+
+    from app.providers.base import VoiceId
+    from app.providers.tts import EdgeTextToSpeech
+
+    class FakeEdge(EdgeTextToSpeech):
+        """Real streaming logic, fake network and fake decoder."""
+
+        def __init__(self):
+            super().__init__(rate=24_000)
+            self.parts = [b"x" * 3000] * 6   # six bursts of "mp3"
+
+        async def _stream_mp3(self, text, voice_name):
+            for part in self.parts:
+                yield part
+
+        def _decode(self, mp3: bytes):
+            # One byte of "mp3" stands for one sample.
+            return np.zeros(len(mp3), dtype=np.int16)
+
+    async def run():
+        got = []
+        async for chunk in FakeEdge().synthesize("a whole sentence", VoiceId("edge", "ur")):
+            got.append(chunk.pcm.size)
+        return got
+
+    sizes = aio.run(run())
+    audible = [n for n in sizes if n > 0]
+    assert len(audible) > 1, (
+        f"the whole utterance arrived in one block ({sizes}); nothing would be "
+        "heard until synthesis finished"
+    )
+    # Nothing is emitted twice: the total is the full stream, once.
+    assert sum(audible) == 18_000
+
+
+# ----------------------------------------------------------------------
+# first run should reach the bubble, not a form
+# ----------------------------------------------------------------------
+
+
+class FakeManagerWithDefaults(FakeManager):
+    def __init__(self, playback, *, default_in="Microphone Array",
+                 default_out=None):
+        super().__init__(playback)
+        self._default_in = default_in
+        self._default_out = default_out or playback[0]
+
+    def default_input(self) -> DeviceRef:
+        return dev(self._default_in, 99, **CAPTURE)
+
+    def default_output(self) -> DeviceRef:
+        return dev(self._default_out, 0)
+
+
+def test_two_cables_are_chosen_and_saved_without_asking(tmp_path):
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+        "CABLE-B Input (VB-Audio Cable B)",
+    ])
+    notes, problems = autoconfigure(cfg, mgr, save=False)
+
+    assert problems == []
+    assert cfg.devices.microphone == "Microphone Array"
+    assert cfg.devices.headphones == "Speaker (Realtek(R) Audio)"
+    assert cfg.devices.virtual_mic != cfg.devices.teams_speaker
+    assert "CABLE" in cfg.devices.virtual_mic
+    assert "CABLE" in cfg.devices.teams_speaker
+    assert len(notes) == 4
+
+
+def test_one_cable_says_the_one_thing_that_is_missing():
+    """Not three feedback-loop complaints, which are consequences of it."""
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+    ])
+    _notes, problems = autoconfigure(cfg, mgr, save=False)
+
+    assert len(problems) == 1
+    assert "TWO virtual cables" in problems[0]
+    assert "listen.py" in problems[0], "the one-way way out must be offered"
+
+
+def test_a_cable_you_can_hear_is_never_picked():
+    # Feedback loop §5.6: the endpoint we render into must not be audible.
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    cfg.devices.headphones = "CABLE Input (VB-Audio Virtual Cable)"
+    mgr = FakeManagerWithDefaults(["CABLE Input (VB-Audio Virtual Cable)"])
+    autoconfigure(cfg, mgr, save=False)
+    assert cfg.devices.virtual_mic == ""
+
+
+def test_choices_already_made_are_never_overwritten():
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    cfg.devices.microphone = "My Good Headset"
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+        "CABLE-B Input (VB-Audio Cable B)",
+    ])
+    autoconfigure(cfg, mgr, save=False)
+    assert cfg.devices.microphone == "My Good Headset"
+
+
+def test_a_complete_autoconfigure_marks_setup_done(tmp_path):
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    cfg.save(tmp_path / "settings.json")  # so save() has somewhere to go
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+        "CABLE-B Input (VB-Audio Cable B)",
+    ])
+    _notes, problems = autoconfigure(cfg, mgr, save=False)
+    assert problems == []
+    # save=False here so the test never writes to the real profile; the flag
+    # is what the application acts on.
+    assert cfg.devices.virtual_mic and cfg.devices.teams_speaker
+
+
+# ----------------------------------------------------------------------
+# the bubble, and being able to photograph it
+# ----------------------------------------------------------------------
+
+
+def test_startup_never_puts_a_form_in_front_of_the_bubble():
+    """A modal setup window is a door where a sign would do.
+
+    Someone who has already configured this - or who only wants to look at it
+    - should get the interface. When audio cannot start the bubble goes red
+    and the panel says why, with Settings one click away inside it.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    # Parsed from source, not imported: this must hold on a machine without
+    # PySide6, which is where the tests run.
+    source = _Path("app/controllers/main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    run = next(
+        node
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == "Application"
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run"
+    )
+    called = {
+        node.func.attr
+        for node in ast.walk(run)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "_show_ui" in called
+    assert "_run_setup" not in called, (
+        "startup opens the setup dialog again; the bubble should come up "
+        "either way"
+    )
+
+
+def test_capture_exclusion_is_one_switch_for_every_window(monkeypatch):
+    from app.views import capture_guard
+
+    applied = []
+    monkeypatch.setattr(
+        capture_guard, "exclude_from_capture", lambda w: applied.append(w) or True
+    )
+    monkeypatch.setattr(capture_guard, "no_activate", lambda w: False)
+    monkeypatch.setattr(capture_guard, "supported", lambda: True)
+
+    try:
+        capture_guard.set_enabled(False)
+        capture_guard.harden(object(), unfocusable=False)
+        assert applied == [], "a window hid itself while the switch was off"
+
+        capture_guard.set_enabled(True)
+        capture_guard.harden(object(), unfocusable=False)
+        assert len(applied) == 1, "the switch did not turn back on"
+    finally:
+        capture_guard.set_enabled(True)
+
+
+def test_the_waiver_is_never_written_to_the_profile():
+    """§2.4 is not a preference. A saved "off" waits for the wrong moment."""
+    from app.models.config import Config
+
+    assert Config().ui.exclude_from_capture is True
+
+
+def test_a_speaker_saved_as_a_cable_is_repaired_not_respected():
+    """The state a first run leaves behind when every dropdown defaults alike.
+
+    "Never overwrite a choice already made" is right for a microphone. For
+    the two cable roles it is wrong: they MUST be virtual cables, so a saved
+    speaker there is not a preference anybody expressed - it is the leftover
+    of a setup window where every dropdown defaulted to the same endpoint.
+    Respecting it means explaining the same feedback-loop refusal for ever
+    while a working cable sits unused in the list.
+    """
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    cfg.devices.headphones = "Speaker (Realtek(R) Audio)"
+    cfg.devices.virtual_mic = "Speaker (Realtek(R) Audio)"     # the leftover
+    cfg.devices.teams_speaker = "Speaker (Realtek(R) Audio)"
+
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+        "CABLE-B Input (VB-Audio Cable B)",
+    ])
+    notes, problems = autoconfigure(cfg, mgr, save=False)
+
+    assert problems == []
+    assert cfg.devices.virtual_mic != cfg.devices.headphones
+    assert "CABLE" in cfg.devices.virtual_mic
+    assert "CABLE" in cfg.devices.teams_speaker
+    assert any("cleared" in n for n in notes), "the repair was silent"
+
+
+def test_a_real_cable_choice_is_still_left_alone():
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    cfg.devices.virtual_mic = "CABLE-B Input (VB-Audio Cable B)"
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+        "CABLE-B Input (VB-Audio Cable B)",
+    ])
+    autoconfigure(cfg, mgr, save=False)
+    assert cfg.devices.virtual_mic == "CABLE-B Input (VB-Audio Cable B)"
+    assert cfg.devices.teams_speaker == "CABLE Input (VB-Audio Virtual Cable)"
+
+
+def test_one_cable_is_never_handed_out_for_both_roles():
+    """A collision is the same failure as a speaker: our English feeds back in.
+
+    Repairing a bad `virtual_mic` on a machine with a single cable must not
+    quietly assign that cable to both roles and report success.
+    """
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    cfg.devices.headphones = "Speaker (Realtek(R) Audio)"
+    cfg.devices.virtual_mic = "Speaker (Realtek(R) Audio)"        # leftover
+    cfg.devices.teams_speaker = "CABLE Input (VB-Audio Virtual Cable)"
+
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+    ])
+    _notes, problems = autoconfigure(cfg, mgr, save=False)
+
+    assert cfg.devices.virtual_mic != cfg.devices.teams_speaker or not problems
+    assert problems, "a one-cable machine was told two-way mode was ready"
+    assert "TWO virtual cables" in problems[0]
+
+
+# ----------------------------------------------------------------------
+# the OpenAI realtime wire shape
+# ----------------------------------------------------------------------
+
+
+def test_the_retired_beta_header_is_never_sent():
+    """`beta_api_shape_disabled`, encoded.
+
+    `OpenAI-Beta: realtime=v1` selected the beta wire shape. That shape is
+    retired: a session opened with the header is closed immediately with
+    4000 / invalid_request_error.beta_api_shape_disabled, which reaches the
+    user as "outgoing translation unavailable" with nothing pointing at a
+    header as the cause.
+    """
+    from app.providers.openai_s2st import OpenAiSpeechTranslator
+
+    headers = OpenAiSpeechTranslator("sk-test").headers()
+    assert "OpenAI-Beta" not in headers
+    assert headers["Authorization"] == "Bearer sk-test"
+
+
+def test_the_session_declares_its_type():
+    from app.providers.base import S2stConfig
+    from app.providers.openai_s2st import OpenAiSpeechTranslator
+
+    cfg = S2stConfig(source_language="ur", target_language="en", rate=24_000)
+    payload = OpenAiSpeechTranslator("sk-test").session_update(cfg)
+
+    assert payload["type"] == "session.update"
+    # The GA discriminator. The beta shape had no such field and inferred it
+    # from the header we no longer send.
+    assert payload["session"]["type"] == "realtime"
+    assert payload["session"]["audio"]["output"]["language"] == "en"
+    assert payload["session"]["audio"]["input"]["format"]["rate"] == 24_000
+
+
+def test_the_panel_refits_whenever_its_content_changes():
+    """Two rows of buttons, one a ghost of the previous layout.
+
+    The panel's reason text is word-wrapped and can go from nothing to four
+    lines. `adjustSize` used to run only when the panel opened, so a panel
+    that was ALREADY open kept its old geometry, the card was drawn outside
+    it, and on a frameless translucent window nothing repainted the
+    abandoned pixels.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    source = _Path("app/views/overlay.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    panel = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Panel"
+    )
+    methods = {
+        node.name: node for node in panel.body if isinstance(node, ast.FunctionDef)
+    }
+    assert "_refit" in methods, "the panel never resizes to its content"
+
+    for name in ("apply_state", "apply_metrics", "set_quote"):
+        called = {
+            node.func.attr
+            for node in ast.walk(methods[name])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert "_refit" in called, f"Panel.{name} changes content without refitting"
+
+
+# ----------------------------------------------------------------------
+# staying alive: an idle source, and a dropped socket
+# ----------------------------------------------------------------------
+
+
+def test_an_idle_source_does_not_look_like_a_dead_client(engine_fixture):
+    """The Deepgram 1011 that ends a session when a video goes quiet.
+
+    An idle capture endpoint delivers no callbacks at all - WASAPI loopback
+    on a device nothing is playing into is not a stream of silence, it is no
+    stream. So nothing reaches the recogniser, and it closes the socket after
+    about ten seconds: exactly what happens when a video is paused, buffers,
+    or its audio device fails.
+    """
+    engine, ports, providers, *_ = engine_fixture(["hello"])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    engine._pipe.KEEPALIVE_S = 0.2  # the real one is 4 s
+
+    # Nothing at all is written to the capture ring: the source is idle.
+    assert wait_for(
+        lambda: providers["asr"].stream.pushed_samples > 0, timeout=3.0
+    ), "no keepalive audio was sent; the recogniser would close the session"
+
+
+def test_a_dropped_socket_reconnects_instead_of_ending_the_session(engine_fixture):
+    """A dropped websocket is ordinary - a sleeping laptop, a wifi handover.
+
+    Ending the session for one, and falling back to the original audio, is a
+    worse answer than waiting a moment and dialling again.
+    """
+    engine, ports, providers, *_ = engine_fixture(
+        ["one", "two", "three"], asr_drops_after=1
+    )
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    ports.source.ring.write(loud(300))
+
+    assert wait_for(lambda: len(providers["asr"].streams) >= 2, timeout=5.0), (
+        "the stream died and was never reopened"
+    )
+    assert engine.status == L.LISTENING, (
+        f"status fell to {engine.status!r} instead of recovering"
+    )
+    assert ports.wire.muted is True, "the wire unmuted over a recoverable drop"
+
+
+def test_it_still_gives_up_when_the_recogniser_will_not_answer(engine_fixture):
+    engine, ports, providers, *_ = engine_fixture(["one"], asr_drops_after=0)
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    # Every reopen fails from here on.
+    providers["asr"].fail = True
+
+    assert wait_for(lambda: engine.status == L.DEGRADED, timeout=8.0), (
+        "a recogniser that never answers should end in a fallback, not a "
+        "reconnect loop"
+    )
+    assert ports.wire.muted is False, "degrading must return the original audio"
+
+
+# ----------------------------------------------------------------------
+# video mode: one cable, no microphone
+# ----------------------------------------------------------------------
+
+
+def test_video_mode_needs_one_cable_and_no_microphone():
+    """Nothing is being sent to anybody, so no microphone is opened.
+
+    Not merely unused: opening it would put a live capture of the room into
+    a session that has no direction to send it in.
+    """
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    cfg.mode = "video"
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+    ])
+    _notes, problems = autoconfigure(cfg, mgr, save=False)
+
+    assert problems == [], problems
+    assert cfg.devices.microphone == "", "video mode opened a microphone"
+    assert cfg.devices.teams_speaker == "CABLE Input (VB-Audio Virtual Cable)"
+    assert cfg.devices.headphones == "Speaker (Realtek(R) Audio)"
+
+
+def test_video_mode_still_needs_something_to_listen_to():
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    cfg.mode = "video"
+    mgr = FakeManagerWithDefaults(["Speaker (Realtek(R) Audio)"])
+    _notes, problems = autoconfigure(cfg, mgr, save=False)
+    assert len(problems) == 1
+    assert "one virtual cable" in problems[0]
+
+
+def test_a_machine_set_up_for_meetings_keeps_working_in_video_mode():
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    cfg.mode = "video"
+    cfg.devices.headphones = "Speaker (Realtek(R) Audio)"
+    cfg.devices.virtual_mic = "CABLE In 16ch (VB-Audio Virtual Cable)"
+    cfg.devices.teams_speaker = "CABLE Input (VB-Audio Virtual Cable)"
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+        "CABLE In 16ch (VB-Audio Virtual Cable)",
+    ])
+    _notes, problems = autoconfigure(cfg, mgr, save=False)
+    assert problems == []
+    assert cfg.devices.teams_speaker == "CABLE Input (VB-Audio Virtual Cable)"
+
+
+def test_meeting_mode_still_wants_both_cables_and_a_microphone():
+    from app.controllers.autoconfig import autoconfigure
+
+    cfg = Config()
+    cfg.mode = "meeting"
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+    ])
+    _notes, problems = autoconfigure(cfg, mgr, save=False)
+    assert cfg.devices.microphone == "Microphone Array"
+    assert problems and "TWO virtual cables" in problems[0]
+
+
+def test_the_mode_survives_a_settings_round_trip(tmp_path):
+    path = tmp_path / "settings.json"
+    cfg = Config()
+    cfg.mode = "video"
+    cfg.save(path)
+    assert Config.load(path).mode == "video"
+    # And a file written before modes existed still loads.
+    path.write_text('{"devices": {}}', encoding="utf-8")
+    assert Config.load(path).mode == ""
+
+
+def test_a_pair_with_one_wire_behaves():
+    """Video mode has no outgoing wire; the pair must not assume two."""
+    from app.audio.passthrough import PassthroughPair
+
+    class W:
+        def __init__(self):
+            self.muted = False
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.started = False
+
+        def mute(self):
+            self.muted = True
+
+        def unmute(self):
+            self.muted = False
+
+        def health(self):
+            return {"muted": self.muted}
+
+    incoming = W()
+    pair = PassthroughPair(outgoing=None, incoming=incoming)
+    pair.start()
+    assert incoming.started
+    pair.mute_all()
+    assert incoming.muted
+    pair.unmute_all()
+    assert not incoming.muted
+    assert pair.health()["outgoing"] is None
+    pair.stop()
+    assert not incoming.started

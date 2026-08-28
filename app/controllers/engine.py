@@ -43,7 +43,13 @@ from app.models.terminology import Terminology
 
 @dataclass
 class AudioPorts:
-    """The four endpoints and the two wires the engine drives."""
+    """The endpoints and the wires the engine drives.
+
+    `mic_source` and `vmic_sink` are None in video mode. Nothing is being
+    sent to anybody there: something is playing and you want to understand
+    it, so the microphone is not merely unused - opening it would put a live
+    capture of the room into a session that has no use for one.
+    """
 
     mic_source: object
     vmic_sink: object
@@ -62,11 +68,14 @@ class Engine:
         providers: dict,
         *,
         terminology: Terminology | None = None,
+        outgoing: bool = True,
     ) -> None:
         self.config = config
         self.ports = ports
         self.providers = providers
         self.terminology = terminology or Terminology()
+        #: Whether the Urdu -> English direction exists at all.
+        self.outgoing = outgoing and ports.mic_source is not None
 
         self.modes = ModeMachine()
         self.metrics = MetricsBus()
@@ -220,7 +229,7 @@ class Engine:
             on_transcript=self._transcript,
             on_degrade=lambda kind, why: self._degrade(Direction.INCOMING, kind, why),
         )
-        self._outgoing = OutgoingPipeline(
+        self._outgoing = None if not self.outgoing else OutgoingPipeline(
             s2st=self.providers["s2st"],
             sink=self.ports.vmic_sink,
             metrics=self.metrics,
@@ -234,25 +243,27 @@ class Engine:
             on_degrade=lambda kind, why: self._degrade(Direction.OUTGOING, kind, why),
             suppress_backchannels=p.suppress_backchannels,
         )
-        self._bargein = BargeInHandler(self._incoming, p.barge_in_confirm_ms)
-        self._outgoing.on_speech = self._bargein.on_speech
+        if self._outgoing is not None:
+            self._bargein = BargeInHandler(self._incoming, p.barge_in_confirm_ms)
+            self._outgoing.on_speech = self._bargein.on_speech
 
         failed: list[tuple[Direction, str]] = []
         try:
             await self._incoming.start()
         except Exception as exc:
             failed.append((Direction.INCOMING, str(exc)))
-        try:
-            await self._outgoing.start()
-        except Exception as exc:
-            failed.append((Direction.OUTGOING, str(exc)))
+        if self._outgoing is not None:
+            try:
+                await self._outgoing.start()
+            except Exception as exc:
+                failed.append((Direction.OUTGOING, str(exc)))
 
         self.modes.start()
         # Mute only the wires whose pipeline actually came up. A wire whose
         # pipeline failed must keep passing raw audio (§2.5, §14.1).
         if self._incoming.running:
             self.ports.wires.incoming.mute()
-        if self._outgoing.running:
+        if self._outgoing is not None and self._outgoing.running:
             self.ports.wires.outgoing.mute()
         for direction, why in failed:
             self.modes.degrade(direction, why)
@@ -288,7 +299,11 @@ class Engine:
         teams = self.ports.teams_source
         while True:
             try:
-                if self._outgoing is not None and self._outgoing.running:
+                if (
+                    mic is not None
+                    and self._outgoing is not None
+                    and self._outgoing.running
+                ):
                     raw = mic.ring.read_available()
                     if raw.size:
                         self._outgoing.feed(
@@ -318,6 +333,8 @@ class Engine:
             ("teams", self.ports.teams_source),
             ("headphones", self.ports.phones_sink),
         ):
+            if obj is None:
+                continue
             with contextlib.suppress(Exception):
                 self.metrics.set_audio_health(name, obj.health())
 
@@ -344,6 +361,8 @@ class Engine:
             if direction is Direction.INCOMING
             else self.ports.wires.outgoing
         )
+        if wire is None:  # a direction that does not exist cannot degrade
+            return
         if kind == "impair":
             self.modes.impair(direction, why)
             self._notice("warning", why)

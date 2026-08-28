@@ -229,27 +229,35 @@ class PassthroughPair:
     object that guarantees the client never hears dead air.
     """
 
-    def __init__(self, outgoing: PassthroughWire, incoming: PassthroughWire) -> None:
+    def __init__(
+        self, outgoing: PassthroughWire | None, incoming: PassthroughWire
+    ) -> None:
+        # `outgoing` is None in video mode: there is no microphone and nothing
+        # is being sent to anybody, so there is no second wire to keep alive.
         self.outgoing = outgoing  # mic -> virtual mic  (the client's ears)
         self.incoming = incoming  # Teams -> headphones (the consultant's ears)
 
+    @property
+    def _wires(self) -> tuple[PassthroughWire, ...]:
+        return tuple(w for w in (self.outgoing, self.incoming) if w is not None)
+
     def start(self) -> None:
-        self.outgoing.start()
-        self.incoming.start()
+        for wire in self._wires:
+            wire.start()
 
     def stop(self) -> None:
-        self.outgoing.stop()
-        self.incoming.stop()
+        for wire in self._wires:
+            wire.stop()
 
     def mute_all(self) -> None:
         """Translation is now driving both sinks."""
-        self.outgoing.mute()
-        self.incoming.mute()
+        for wire in self._wires:
+            wire.mute()
 
     def unmute_all(self) -> None:
         """Fall back to raw audio in both directions."""
-        self.outgoing.unmute()
-        self.incoming.unmute()
+        for wire in self._wires:
+            wire.unmute()
 
     def __enter__(self) -> "PassthroughPair":
         self.start()
@@ -259,4 +267,7 @@ class PassthroughPair:
         self.stop()
 
     def health(self) -> dict:
-        return {"outgoing": self.outgoing.health(), "incoming": self.incoming.health()}
+        return {
+            "outgoing": self.outgoing.health() if self.outgoing else None,
+            "incoming": self.incoming.health(),
+        }

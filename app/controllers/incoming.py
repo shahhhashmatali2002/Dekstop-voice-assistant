@@ -123,13 +123,10 @@ class IncomingPipeline:
     async def start(self) -> None:
         if self._running:
             return
-        cfg = AsrConfig(
-            language="en",
-            rate=RATE_ASR,
-            interim_results=True,
-            keyterms=self.terminology.keyterms(),
-        )
-        self._stream = await self.asr.open(cfg)
+        self._stream = await self.asr.open(self._asr_config())
+        # Start was just pressed. Get something audible out quickly, then
+        # settle into the configured trade.
+        self.segmenter.hurry()
         self._running = True
         self._tasks = [
             asyncio.create_task(self._pump_audio(), name="incoming-audio"),
@@ -137,6 +134,14 @@ class IncomingPipeline:
             asyncio.create_task(self._play_loop(), name="incoming-playback"),
             asyncio.create_task(self._unit_worker(), name="incoming-units"),
         ]
+
+    def _asr_config(self) -> AsrConfig:
+        return AsrConfig(
+            language="en",
+            rate=RATE_ASR,
+            interim_results=True,
+            keyterms=self.terminology.keyterms(),
+        )
 
     async def stop(self) -> None:
         self._running = False
@@ -156,11 +161,35 @@ class IncomingPipeline:
 
     # ------------------------------------------------------------------
 
+    #: A streaming recogniser closes the socket when it hears nothing at all
+    #: for long enough - Deepgram allows about ten seconds. That is a problem
+    #: because an IDLE capture endpoint delivers no callbacks at all: WASAPI
+    #: loopback on a device nothing is playing into is not a stream of
+    #: silence, it is no stream. So the queue below simply stays empty, this
+    #: task waits on it for ever, and the session is closed underneath us -
+    #: which the user sees as translation dying the moment a video is paused,
+    #: buffers, or loses its audio device.
+    KEEPALIVE_S = 4.0
+
     async def _pump_audio(self) -> None:
         n = frame_samples(RATE_ASR)
+        silence = np.zeros(n, dtype=np.int16)
         carry = np.empty(0, dtype=np.int16)
+        last_push = now()
+
         while self._running:
-            chunk = await self._audio_in.get()
+            try:
+                chunk = await asyncio.wait_for(self._audio_in.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if (
+                    self._stream is not None
+                    and now() - last_push >= self.KEEPALIVE_S
+                ):
+                    with contextlib.suppress(ProviderError):
+                        await self._stream.push_audio(silence)
+                        last_push = now()
+                continue
+
             buf = np.concatenate([carry, chunk]) if carry.size else chunk
             usable = len(buf) - (len(buf) % n)
             carry = buf[usable:]
@@ -183,31 +212,81 @@ class IncomingPipeline:
                     audio_frame = res.audio if res.audio is not None else frame
                     try:
                         await self._stream.push_audio(audio_frame)
-                    except ProviderError as exc:
-                        await self._degrade(f"recognition: {exc}")
-                        return
+                        last_push = now()
+                    except ProviderError:
+                        # The consumer owns the connection: it will notice the
+                        # same failure and reopen. Tearing the pipeline down
+                        # from here would race it and lose the audio that a
+                        # reconnect is about to be able to use.
+                        pass
 
 
                 if res.event is SpeechEvent.OFFSET:
                     for unit in self.segmenter.flush():
                         self._enqueue(unit)
 
+    #: Consecutive failed reopens before we give up and fall back to the
+    #: original audio. A dropped websocket is ordinary - a laptop sleeping, a
+    #: wifi handover, a provider restarting one node - and ending the session
+    #: for one is a worse answer than waiting a second and dialling again.
+    RECONNECT_ATTEMPTS = 3
+
     async def _consume_hypotheses(self) -> None:
-        assert self._stream is not None
+        """Read hypotheses, and own the lifetime of the connection.
+
+        The connection is owned HERE rather than shared with the audio pump
+        because two tasks reacting to the same dropped socket race each other:
+        one tears the pipeline down while the other is reopening it. The pump
+        writes to whatever stream is current and ignores its own failures; this
+        loop decides whether there is still a session.
+        """
+        failures = 0
+        while self._running:
+            try:
+                if self._stream is None:
+                    break
+                async for hyp in self._stream.hypotheses():
+                    failures = 0
+                    if self._speaking_trace and not self._speaking_trace.t_hypothesis:
+                        self._speaking_trace.mark("hypothesis")
+                    for unit in self.segmenter.push(
+                        Hypothesis(hyp.text, hyp.is_final, hyp.at, speaker=hyp.speaker)
+                    ):
+                        self._enqueue(unit)
+                reason = "the recogniser closed the stream"
+            except asyncio.CancelledError:
+                raise
+            except ProviderError as exc:
+                reason = str(exc)
+            except Exception as exc:  # pragma: no cover
+                reason = str(exc)
+
+            if not self._running:
+                return
+
+            failures += 1
+            if failures > self.RECONNECT_ATTEMPTS or not await self._reopen(failures):
+                await self._degrade(f"recognition stream: {reason}")
+                return
+
+    async def _reopen(self, attempt: int) -> bool:
+        """Dial the recogniser again. False when it will not answer."""
+        await asyncio.sleep(min(2.0, 0.3 * attempt))
+        old, self._stream = self._stream, None
+        if old is not None:
+            with contextlib.suppress(Exception):
+                await old.aclose()
         try:
-            async for hyp in self._stream.hypotheses():
-                if self._speaking_trace and not self._speaking_trace.t_hypothesis:
-                    self._speaking_trace.mark("hypothesis")
-                for unit in self.segmenter.push(
-                    Hypothesis(hyp.text, hyp.is_final, hyp.at, speaker=hyp.speaker)
-                ):
-                    self._enqueue(unit)
-        except asyncio.CancelledError:
-            raise
-        except ProviderError as exc:
-            await self._degrade(f"recognition stream: {exc}")
-        except Exception as exc:  # pragma: no cover
-            await self._degrade(f"recognition stream: {exc}")
+            self._stream = await self.asr.open(self._asr_config())
+        except Exception:
+            return False
+        with contextlib.suppress(Exception):
+            self.metrics.note_reconnect(Direction.INCOMING)
+        # A new session has heard nothing yet; anything half-recognised
+        # belongs to a stream that no longer exists.
+        self.segmenter.reset()
+        self.segmenter.hurry()
+        return True
 
     # ------------------------------------------------------------------
 

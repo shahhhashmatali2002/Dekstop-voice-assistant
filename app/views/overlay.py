@@ -344,6 +344,7 @@ class Panel(OverlayWindow):
 
         if state.get("reason"):
             self.quote.setText(state["reason"])
+        self._refit()
 
     def apply_metrics(self, metrics: dict) -> None:
         def fmt(d):
@@ -352,6 +353,7 @@ class Panel(OverlayWindow):
 
         self.lat_in.setText(f"incoming  EN → UR      {fmt(metrics['incoming'])}")
         self.lat_out.setText(f"outgoing  UR → EN      {fmt(metrics['outgoing'])}")
+        self._refit()
 
     def set_devices(self, mic: bool, phones: bool, teams: bool) -> None:
         tick = lambda ok: "OK" if ok else "—"  # noqa: E731
@@ -361,6 +363,35 @@ class Panel(OverlayWindow):
 
     def set_quote(self, text: str) -> None:
         self.quote.setText(f"“{text}”" if text else "")
+        self._refit()
+
+    def _refit(self) -> None:
+        """Resize to the content while the panel is open, growing upwards.
+
+        Content changes height: an error reason is word-wrapped and can be
+        four lines where the last was none. `adjustSize` otherwise only runs
+        when the panel opens, so a panel that is ALREADY open keeps its old
+        geometry and the card is drawn outside it. On a frameless translucent
+        window nothing repaints the abandoned pixels, so the previous layout
+        stays on screen underneath the new one - two rows of buttons, one of
+        them a ghost.
+
+        It grows upwards because the panel is anchored above the bubble:
+        keeping the top fixed would slide the controls down over it.
+        """
+        if not self.isVisible():
+            return
+        before = self.geometry()
+        self.adjustSize()
+        left, bottom = before.left(), before.bottom()
+        top = bottom - self.height() + 1
+
+        screen = QApplication.screenAt(before.center()) or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            top = max(area.top(), min(top, area.bottom() - self.height()))
+        self.move(left, top)
+        self.update()
 
     # ------------------------------------------------------------------
 

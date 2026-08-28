@@ -62,7 +62,12 @@ import threading
 from dataclasses import dataclass
 
 from app.audio import convert
-from app.audio.devices import AudioUnavailable, DeviceManager, DeviceRef
+from app.audio.devices import (
+    AudioUnavailable,
+    DeviceManager,
+    DeviceRef,
+    looks_virtual,
+)
 from app.audio.formats import RATE_ASR, RATE_S2ST
 from app.audio.passthrough import PassthroughWire
 from app.audio.streams import CaptureSource, RenderSink
@@ -183,10 +188,6 @@ def feedback_problems(source: DeviceRef | None, output: DeviceRef | None) -> lis
 
 
 
-#: Substrings that identify a virtual audio device, whoever made it.
-VIRTUAL_HINTS = ("cable", "voicemeeter", "vb-audio", "virtual audio")
-
-
 def cable_scan(devices) -> str:
     """Is a virtual cable present on ANY host API, not just WASAPI?
 
@@ -196,10 +197,7 @@ def cable_scan(devices) -> str:
     cause - looks exactly like a cable that was never installed. The fix is
     completely different in each case, so it is worth one extra scan.
     """
-    hits = [
-        d for d in devices
-        if any(h in d.name.lower() for h in VIRTUAL_HINTS)
-    ]
+    hits = [d for d in devices if looks_virtual(d.name)]
     if not hits:
         return (
             "  No virtual audio device on any host API. The driver is not "

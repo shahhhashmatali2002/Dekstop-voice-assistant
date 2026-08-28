@@ -209,6 +209,7 @@ class Segmenter:
         self.min_words = min_words
         self._emitted = ""  # frozen; never revisited - WITHIN one utterance
         self._last_spoken = ""  # the previous utterance, to catch repeat finals
+        self._normal: tuple[float, int] | None = None  # settings held during a hurry
 
     # ------------------------------------------------------------------
 
@@ -219,6 +220,28 @@ class Segmenter:
     @property
     def pending(self) -> str:
         return ""
+
+    def hurry(self, *, stable_ms: float = 120.0, max_words: int = 7) -> None:
+        """Emit the FIRST unit early, then go back to the configured settings.
+
+        Pressing Start in the middle of a sentence and then waiting for a
+        whole clause to be confirmed feels broken, however correct it is: the
+        listener has no way to tell "working, nothing to say yet" from "not
+        working". Cutting the first unit short gets a voice into their ears
+        quickly; everything after it is worth the wait it costs.
+        """
+        if self._normal is not None:
+            return
+        self._normal = (self.stability.stable_ms, self.max_words)
+        self.stability.stable_ms = stable_ms
+        self.max_words = max_words
+
+    def _settle(self) -> None:
+        """Something was spoken. Back to the settings the user chose."""
+        if self._normal is None:
+            return
+        self.stability.stable_ms, self.max_words = self._normal
+        self._normal = None
 
     def reset(self) -> None:
         """Start completely clean. Called when the pipeline stops."""
@@ -264,6 +287,8 @@ class Segmenter:
                 units.append(Unit(rest, "final", hyp.at, hyp.speaker))
                 self._emitted = (self._emitted + " " + rest).strip()
             self._end_utterance()
+            if units:
+                self._settle()
             return units
 
         stable = self.stability.update(text, hyp.at)
@@ -280,6 +305,7 @@ class Segmenter:
             if chunk and len(chunk.split()) >= self.min_words:
                 units.append(Unit(chunk, "max_words", hyp.at, hyp.speaker))
                 self._emitted = (self._emitted + " " + chunk).strip()
+                self._settle()
                 return units
 
         # Rule (b): stable AND ends at a clause boundary.
@@ -287,6 +313,7 @@ class Segmenter:
             if len(rest.split()) >= self.min_words:
                 units.append(Unit(rest, "stable", hyp.at, hyp.speaker))
                 self._emitted = (self._emitted + " " + rest).strip()
+                self._settle()
         return units
 
     def flush(self, reason: str = "vad") -> list[Unit]:
@@ -311,6 +338,7 @@ class Segmenter:
         self.stability.reset()
         if rest and len(rest.split()) >= 1:
             self._emitted = (self._emitted + " " + rest).strip()
+            self._settle()
             return [Unit(rest, reason)]
         return []
 

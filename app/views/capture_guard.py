@@ -140,6 +140,24 @@ def no_activate(window) -> bool:
         return False
 
 
+#: Process-wide switch for §2.4. True is the shipping default and the only
+#: value that is safe in front of a client: an always-on-top overlay carrying
+#: a live transcript of the other person's words appears in a screen share
+#: unless it is excluded. It is turned off deliberately - to photograph the
+#: interface, or to demonstrate it over a call - and never quietly.
+_ENABLED = True
+
+
+def set_enabled(on: bool) -> None:
+    """Turn capture exclusion on or off for every window in this process."""
+    global _ENABLED
+    _ENABLED = bool(on)
+
+
+def enabled() -> bool:
+    return _ENABLED
+
+
 def harden(window, *, exclude: bool = True, unfocusable: bool = True) -> dict:
     """Apply every protection a top-level window needs. Call once, after show().
 
@@ -147,6 +165,7 @@ def harden(window, *, exclude: bool = True, unfocusable: bool = True) -> dict:
     than assume - an overlay that silently failed to exclude itself is the
     §13.3 disclosure risk realised.
     """
+    exclude = exclude and _ENABLED
     return {
         "supported": supported(),
         "excluded": exclude_from_capture(window) if exclude else False,

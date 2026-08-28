@@ -205,31 +205,54 @@ class OpenAiSpeechTranslator(SpeechTranslator):
             raise ProviderMisconfigured("pip install websockets") from exc
 
 
-        url = f"{ENDPOINT}?model={cfg.model or self.model}"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "OpenAI-Beta": "realtime=v1",
-        }
+        url = self.url(cfg)
         try:  # pragma: no cover - network path
-            ws = await websockets.connect(url, additional_headers=headers)
+            ws = await websockets.connect(
+                url, additional_headers=self.headers()
+            )
         except Exception as exc:
             raise ProviderUnavailable(f"could not open s2st session: {exc}") from exc
 
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "audio": {
-                            "input": {"format": {"type": "audio/pcm", "rate": cfg.rate}},
-                            "output": {
-                                "format": {"type": "audio/pcm", "rate": cfg.rate},
-                                "language": cfg.target_language,
-                                **({"voice": cfg.voice} if cfg.voice else {}),
-                            },
-                        }
-                    },
-                }
-            )
-        )
+        await ws.send(json.dumps(self.session_update(cfg)))
         return OpenAiS2stStream(ws, cfg.rate)
+
+    # ------------------------------------------------------------------
+    # the wire shape, kept as pure functions so it can be tested without a
+    # socket - this is the part that broke when the beta API was retired
+    # ------------------------------------------------------------------
+
+    def url(self, cfg: S2stConfig) -> str:
+        return f"{ENDPOINT}?model={cfg.model or self.model}"
+
+    def headers(self) -> dict:
+        """Authorization only.
+
+        `OpenAI-Beta: realtime=v1` selected the beta wire shape and MUST NOT
+        be sent: the beta shape is retired, and a session opened with it is
+        closed immediately with 4000 / invalid_request_error
+        .beta_api_shape_disabled - which reaches the user as "outgoing
+        translation unavailable" with no hint that a header is the cause.
+        """
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def session_update(self, cfg: S2stConfig) -> dict:
+        """The GA session shape.
+
+        `session.type` is the discriminator the GA interface requires; the
+        beta shape had no such field and inferred it from the header we no
+        longer send.
+        """
+        return {
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "audio": {
+                    "input": {"format": {"type": "audio/pcm", "rate": cfg.rate}},
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": cfg.rate},
+                        "language": cfg.target_language,
+                        **({"voice": cfg.voice} if cfg.voice else {}),
+                    },
+                },
+            },
+        }

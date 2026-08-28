@@ -36,6 +36,7 @@ from app.audio.passthrough import PassthroughPair, PassthroughWire
 from app.audio.streams import CaptureSource, RenderSink
 from app.providers.base import ProviderMisconfigured
 from app.models.config import Config
+from app.controllers.autoconfig import autoconfigure
 from app.controllers.engine import AudioPorts, Engine
 from app.models.state import Colour, Mode
 from app.models.terminology import Terminology
@@ -122,6 +123,19 @@ class Application:
             return None, [str(exc)]
         dm = self._dm
 
+        # Decide everything that can be decided from what the machine has,
+        # and save it, so a first run reaches the bubble instead of a form
+        # (§11.7). Only blanks are filled; a choice already made stands.
+        video = self.config.mode == "video"
+        chosen, blocking = autoconfigure(self.config, dm)
+        for choice in chosen:
+            self._on_notice({"severity": "info", "message": f"Auto: {choice}"})
+        if blocking:
+            # Report the missing thing, not its three consequences. Without a
+            # second cable every role falls back to the same speaker and the
+            # feedback checks fire three times, describing symptoms.
+            return None, blocking
+
         def resolve(name: str, role: str, capture: bool, fallback=None):
             """Resolve one endpoint, falling back to the Windows default.
 
@@ -161,10 +175,17 @@ class Application:
                 problems.append(f"{role}: {exc}")
                 return None
 
-        mic_dev = resolve(d.microphone, "Microphone", True, dm.default_input)
         phones_dev = resolve(d.headphones, "Headphones", False, dm.default_output)
-        vmic_dev = resolve(d.virtual_mic, "Translator microphone", False)
-        teams_dev = resolve(d.teams_speaker, "Teams speaker", False)
+        teams_dev = resolve(d.teams_speaker, "Source" if video else "Teams speaker",
+                            False)
+        if video:
+            # No microphone, no second cable: one thing to listen to and one
+            # place to speak. Opening the other two would be capturing the
+            # room for a direction that does not exist.
+            mic_dev = vmic_dev = None
+        else:
+            mic_dev = resolve(d.microphone, "Microphone", True, dm.default_input)
+            vmic_dev = resolve(d.virtual_mic, "Translator microphone", False)
 
         teams_lb = None
         if teams_dev is not None:
@@ -180,20 +201,21 @@ class Application:
         for note in notes:
             self._on_notice({"severity": "info", "message": note})
 
-        if None in (mic_dev, phones_dev, vmic_dev) or teams_lb is None or problems:
+        required = (phones_dev,) if video else (mic_dev, phones_dev, vmic_dev)
+        if None in required or teams_lb is None or problems:
             return None, problems
 
-        mic = CaptureSource(dm, mic_dev)
         phones = RenderSink(dm, phones_dev)
-        vmic = RenderSink(dm, vmic_dev)
         teams = CaptureSource(dm, teams_lb)
+        mic = None if video else CaptureSource(dm, mic_dev)
+        vmic = None if video else RenderSink(dm, vmic_dev)
 
-        self._streams = [mic, phones, vmic, teams]
+        self._streams = [s for s in (mic, phones, vmic, teams) if s is not None]
         for s in self._streams:
             s.start()
 
         wires = PassthroughPair(
-            outgoing=PassthroughWire(mic, vmic, name="mic->vmic"),
+            outgoing=None if video else PassthroughWire(mic, vmic, name="mic->vmic"),
             # The headphone wire may emit true silence; only the path feeding
             # Teams needs a comfort-noise floor (§5.7).
             incoming=PassthroughWire(
@@ -205,11 +227,11 @@ class Application:
         # at the call site, and one that only Windows ever reaches.
         return AudioPorts(mic, vmic, teams, phones, wires), problems
 
-    def build_providers(self) -> dict:
+    def build_providers(self, *, include_s2st: bool = True) -> dict:
         """The configured provider stack. Shared with listen mode (§8.6)."""
         from app.providers.factory import build_providers
 
-        return build_providers(self.config)
+        return build_providers(self.config, include_s2st=include_s2st)
 
     # ------------------------------------------------------------------
     # UI wiring
@@ -452,20 +474,60 @@ class Application:
         user buttons that do nothing.
         """
         self._install_signal_handlers()
+        capture_guard.set_enabled(self.config.ui.exclude_from_capture)
+        if not self.config.mode and not self._ask_mode():
+            return 0  # the question was closed rather than answered
 
         ports, problems = self.build_audio()
-        if ports is None:
-            if not self._run_setup(problems):
-                return 0  # user cancelled setup; there is nothing to run
-            ports, problems = self.build_audio()
-            if ports is None:
-                self._show_ui()
-                self._setup_needed(problems)
-                return self.qt.exec()
 
+        # The bubble comes up either way. A modal form in front of someone who
+        # has already configured this - or who only wants to look at it - is a
+        # door where a sign would do: the bubble goes red, the panel says what
+        # is wrong, and Settings is one click away in it.
         self._show_ui()
-        self._start_engine(ports)
+        if ports is None:
+            self._setup_needed(problems)
+        else:
+            self._start_engine(ports)
         return self.qt.exec()
+
+    def _ask_mode(self) -> bool:
+        """Ask what is being translated, once, and remember the answer.
+
+        The two topologies are genuinely different and neither can be
+        inferred: one cable and no microphone for something that is playing,
+        two cables and a live microphone for a conversation. Guessing wrong
+        is not a cosmetic error - it opens a microphone nobody asked for, or
+        it fails to open the one the call needs.
+        """
+        from PySide6.QtWidgets import QMessageBox
+
+        box = QMessageBox()
+        box.setWindowTitle("What are you translating?")
+        box.setText("What would you like to translate?")
+        box.setInformativeText(
+            "A video, a podcast, anything playing on this computer\n"
+            "    English in, Urdu out. One cable, microphone stays off.\n\n"
+            "A Teams call\n"
+            "    Both directions. Needs a second cable and your microphone."
+        )
+        video = box.addButton("Something playing", QMessageBox.AcceptRole)
+        meeting = box.addButton("A Teams call", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(video)
+        capture_guard.harden(box, unfocusable=False)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is video:
+            self.config.mode = "video"
+        elif clicked is meeting:
+            self.config.mode = "meeting"
+        else:
+            return False
+        self.config.save()
+        print(f"  Mode: {self.config.mode} (change it with --mode)")
+        return True
 
     def _install_signal_handlers(self) -> None:
         """Make Ctrl+C in the console actually quit.
@@ -557,11 +619,13 @@ class Application:
             self._open_settings()
 
     def _start_engine(self, ports: AudioPorts) -> None:
+        video = self.config.mode == "video"
         self.engine = Engine(
             self.config,
             ports,
-            self.build_providers(),
+            self.build_providers(include_s2st=not video),
             terminology=Terminology.load(self.config.terminology_path()),
+            outgoing=not video,
         )
         # Engine callbacks fire on the engine thread; the signals hop to Qt.
         self.engine.on_transcript = self.bridge.transcript.emit
@@ -613,8 +677,17 @@ def _report_startup_failure(message: str, exc: BaseException) -> None:
         pass
 
 
-def main() -> int:
+def main(*, allow_capture: bool = False, mode: str = "") -> int:
     config = Config.load()
+    if mode:
+        config.mode = mode
+    if allow_capture:
+        # One run only. §2.4 is not a preference, and a saved "off" would sit
+        # there quietly until the call where it matters.
+        config.ui.exclude_from_capture = False
+        print("\n  Capture exclusion waived: every window will show up in "
+              "screenshots\n  - and in a screen share. Do not leave this on "
+              "for a real call.")
     print(
         "\n  Urdu <-> English translator\n"
         + ("  Devices are not configured yet - Settings will open.\n"

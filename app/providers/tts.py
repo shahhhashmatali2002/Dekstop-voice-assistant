@@ -262,44 +262,99 @@ class NullTextToSpeech(TextToSpeech):
 
 
 class EdgeTextToSpeech(TextToSpeech):
-    """Free Neural TTS synthesis via Edge TTS (Microsoft Neural Voices)."""
+    """Free neural synthesis via Edge TTS, decoded as it arrives.
+
+    WHY THIS DECODES INCREMENTALLY
+    ------------------------------
+    Edge TTS streams MP3 over a websocket while it is still synthesising. The
+    obvious implementation - collect every chunk, decode once at the end -
+    throws that away: nothing is audible until the whole sentence has been
+    generated AND transferred, so a five-second sentence is five seconds of
+    silence followed by five seconds of speech. Time to first sound is the
+    number a listener actually experiences, and it becomes the length of the
+    sentence rather than the length of the network round trip.
+
+    MP3 is a sequence of self-contained frames, so a partial stream decodes
+    fine. We decode what has arrived, emit only the samples we have not
+    emitted yet, and hold back a frame's worth at the boundary - the last
+    frame of a truncated buffer can decode differently once its remainder
+    arrives, and re-emitting a corrected sample is a click.
+    """
 
     name = "edge-tts"
 
+    #: Decode once this much new MP3 has arrived. At Edge's 48 kbit/s that is
+    #: roughly 300 ms of audio: often enough to keep the sink fed, rarely
+    #: enough to spend real time re-decoding.
+    DECODE_EVERY_BYTES = 2_000
+
+    #: Samples held back from a partial decode, comfortably over one MP3
+    #: frame (1152 samples).
+    TAIL_GUARD = 2_304
+
     def __init__(self, rate: int = 24_000) -> None:
         self.rate = rate
+
+    def _decode(self, mp3: bytes):
+        """Seam: overridden in tests so the streaming logic can be exercised."""
+        try:
+            import miniaudio
+        except ImportError as exc:
+            raise ProviderMisconfigured("pip install miniaudio") from exc
+
+        decoded = miniaudio.decode(mp3, nchannels=1, sample_rate=self.rate)
+        return np.frombuffer(decoded.samples, dtype=DTYPE)
+
+    async def _stream_mp3(self, text: str, voice_name: str):
+        try:
+            import edge_tts
+        except ImportError as exc:
+            raise ProviderMisconfigured("pip install edge-tts") from exc
+
+        comm = edge_tts.Communicate(text, voice_name)
+        async for chunk in comm.stream():
+            if chunk["type"] == "audio":
+                yield chunk["data"]
 
     async def synthesize(
         self, text: str, voice: VoiceId
     ) -> AsyncIterator[PcmChunk]:
         if not text.strip():
             return
+        voice_name = (
+            voice.name
+            if (voice and voice.name and voice.name != "azure")
+            else "ur-PK-UzmaNeural"
+        )
         try:
-            import edge_tts
-            import miniaudio
-        except ImportError as exc:
-            raise ProviderMisconfigured("pip install edge-tts miniaudio") from exc
-
-        voice_name = voice.name if (voice and voice.name and voice.name != "azure") else "ur-PK-UzmaNeural"
-        try:
-            comm = edge_tts.Communicate(text, voice_name)
             mp3 = b""
-            async for chunk in comm.stream():
-                if chunk["type"] == "audio":
-                    mp3 += chunk["data"]
+            decoded_at = 0
+            emitted = 0
+
+            async for data in self._stream_mp3(text, voice_name):
+                mp3 += data
+                if len(mp3) - decoded_at < self.DECODE_EVERY_BYTES:
+                    continue
+                decoded_at = len(mp3)
+                try:
+                    samples = self._decode(mp3)
+                except Exception:
+                    continue  # not a frame boundary yet; wait for more
+                safe = max(0, samples.size - self.TAIL_GUARD)
+                if safe > emitted:
+                    yield PcmChunk(samples[emitted:safe].copy(), self.rate)
+                    emitted = safe
+
             if not mp3:
                 return
-            decoded = miniaudio.decode(mp3, nchannels=1, sample_rate=self.rate)
-            samples = np.frombuffer(decoded.samples, dtype=DTYPE)
-
-            chunk_size = self.rate // 5
-            for i in range(0, len(samples), chunk_size):
-                chunk_pcm = samples[i : i + chunk_size]
-                yield PcmChunk(chunk_pcm, self.rate)
-                await asyncio.sleep(0.005)
+            samples = self._decode(mp3)
+            if samples.size > emitted:
+                yield PcmChunk(samples[emitted:].copy(), self.rate)
             yield PcmChunk(np.empty(0, dtype=DTYPE), self.rate, final=True)
 
         except asyncio.CancelledError:
+            raise
+        except ProviderMisconfigured:
             raise
         except Exception as exc:
             raise ProviderUnavailable(f"Edge TTS failed: {exc}") from exc

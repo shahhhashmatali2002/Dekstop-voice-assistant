@@ -92,6 +92,14 @@ def main() -> int:
                     help="list audio endpoints and exit")
     ap.add_argument("--check", action="store_true",
                     help="verify the install and exit")
+    ap.add_argument("--mode", choices=("video", "meeting"),
+                    help="'video': something is playing and you want to "
+                         "understand it - one cable, microphone off. "
+                         "'meeting': a two-way Teams call. Asked once and "
+                         "remembered if not given.")
+    ap.add_argument("--allow-capture", action="store_true",
+                    help="let every window appear in screenshots and screen "
+                         "shares (they are excluded by default, §2.4)")
     args = ap.parse_args()
 
     if args.check:
@@ -116,7 +124,7 @@ def main() -> int:
 
     from app.controllers.main import main as app_main
 
-    return app_main()
+    return app_main(allow_capture=args.allow_capture, mode=args.mode or "")
 
 
 if __name__ == "__main__":

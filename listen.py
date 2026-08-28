@@ -219,6 +219,14 @@ def format_health(snapshot: dict) -> str:
     audio = snapshot.get("metrics", {}).get("audio", {})
     ttfta = (inc.get("ttfta") or {}).get("p50")
     out = audio.get("output") or {}
+    stages = inc.get("stages") or {}
+    breakdown = "  ".join(
+        f"{name} {(stats or {}).get('p50', 0) or 0:.0f}ms"
+        for name, stats in stages.items()
+        if (stats or {}).get("p50")
+    )
+    tail = f"\n     first sound: {breakdown}" if breakdown else ""
+
     return (
         f"  [{snapshot.get('status', '?')}] "
         f"lag {inc.get('queue_depth_ms', 0) / 1000:.1f}s  "
@@ -227,6 +235,7 @@ def format_health(snapshot: dict) -> str:
         f"dropped {inc.get('dropped', 0)}  "
         f"gaps {out.get('underruns', 0)}  "
         + (f"behind {ttfta / 1000:.1f}s" if ttfta else "")
+        + tail
     )
 
 
@@ -324,6 +333,8 @@ def run_window(cfg: Config) -> int:
         transcript = Signal(dict)
         notice = Signal(dict)
 
+    capture_guard.set_enabled(cfg.ui.exclude_from_capture)
+
     qt = QApplication.instance() or QApplication(sys.argv)
     with contextlib.suppress(Exception):
         install_errors(qt)
@@ -354,8 +365,6 @@ def run_window(cfg: Config) -> int:
         print()
         window.set_blocked(problems)
         window.show()
-        if not cfg.ui.exclude_from_capture:
-            capture_guard.allow_capture(window)
         return qt.exec()
 
     window.set_devices(ports.describe())
@@ -379,22 +388,8 @@ def run_window(cfg: Config) -> int:
     window.start_clicked.connect(engine.start_listening)
     window.stop_clicked.connect(engine.stop_listening)
     window.pause_clicked.connect(engine.toggle)
-    def show_captured(widget) -> None:
-        """Show a window, then undo the capture exclusion if it was waived.
-
-        Order matters: OverlayWindow.showEvent is what applies the exclusion,
-        and it cannot run before the window has a native handle. Undoing it
-        first would simply be overwritten.
-        """
-        widget.show()
-        if not cfg.ui.exclude_from_capture:
-            capture_guard.allow_capture(widget)
-
     def toggle_subtitles() -> None:
-        if subtitles.isVisible():
-            subtitles.hide()
-            return
-        show_captured(subtitles)
+        subtitles.hide() if subtitles.isVisible() else subtitles.show()
 
     window.subtitles_clicked.connect(toggle_subtitles)
     qt.aboutToQuit.connect(engine.shutdown)
@@ -405,7 +400,7 @@ def run_window(cfg: Config) -> int:
         subtitles.add_notice("warning", warning)
 
     engine.start()
-    show_captured(window)
+    window.show()
     if cfg.listen.autostart:
         engine.start_listening()
     return qt.exec()

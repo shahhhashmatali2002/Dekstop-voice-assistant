@@ -261,6 +261,16 @@ class DeviceManager:
 # ----------------------------------------------------------------------
 
 
+#: Substrings that identify a virtual audio device, whoever made it.
+VIRTUAL_HINTS = ("cable", "voicemeeter", "vb-audio", "virtual audio")
+
+
+def looks_virtual(name: str) -> bool:
+    """Is this endpoint a virtual cable rather than something you can hear?"""
+    lowered = (name or "").lower()
+    return any(hint in lowered for hint in VIRTUAL_HINTS)
+
+
 def format_device_table(devices: list[DeviceRef]) -> str:
     """Human-readable listing, used by the Phase 0 scripts."""
     if not devices:
