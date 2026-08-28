@@ -85,6 +85,63 @@ DEGRADED = "degraded"  # a provider failed; English audible again
 
 
 # ----------------------------------------------------------------------
+# presets
+# ----------------------------------------------------------------------
+
+#: Fluency and lag are the same dial, and the right setting depends entirely
+#: on what you are listening to.
+#:
+#: The pipeline emits a unit when the recogniser's text has been stable for
+#: `stability_ms`, or when it reaches `max_words`. Short units reach your ears
+#: sooner and are synthesised in isolation, so the voice restarts its prosody
+#: every few words - accurate, and it sounds like someone reading a list.
+#: Longer units are spoken as whole thoughts, which is what fluent sounds
+#: like, and they arrive later.
+#:
+#: The drift thresholds are the other half. Past `drift_comfortable_ms` of
+#: measured lag the audio is time-stretched to catch up, and the stretch is
+#: heard as a metallic edge long before it is heard as speed. In a live call
+#: that trade is worth it. Watching a recording it is not: nothing is waiting
+#: on you, so let the lag sit where it lands and keep the voice clean.
+PRESETS = {
+    "fluent": dict(
+        stability_ms=500.0, max_words=28, vad_hangover_ms=600.0,
+        playback_preroll_ms=400.0,
+        drift_comfortable_ms=4000.0, drift_stretch_ms=12000.0,
+        drift_aggressive_ms=25000.0, drift_max_rate=1.08,
+    ),
+    "balanced": dict(
+        stability_ms=300.0, max_words=18, vad_hangover_ms=400.0,
+        playback_preroll_ms=300.0,
+        drift_comfortable_ms=2000.0, drift_stretch_ms=6000.0,
+        drift_aggressive_ms=12000.0, drift_max_rate=1.12,
+    ),
+    "fast": dict(
+        stability_ms=150.0, max_words=10, vad_hangover_ms=300.0,
+        playback_preroll_ms=200.0,
+        drift_comfortable_ms=800.0, drift_stretch_ms=2500.0,
+        drift_aggressive_ms=5000.0, drift_max_rate=1.20,
+    ),
+}
+
+PRESET_NOTES = {
+    "fluent": "whole thoughts, natural voice, several seconds behind - for video",
+    "balanced": "a compromise; start here if you are unsure",
+    "fast": "short phrases, closest to real time - for a live conversation",
+}
+
+
+def apply_preset(config: Config, name: str) -> str:
+    """Write one preset into the pipeline settings. Returns what it did."""
+    values = PRESETS.get(name)
+    if values is None:
+        raise KeyError(f"unknown preset {name!r}; try {', '.join(PRESETS)}")
+    for field_name, value in values.items():
+        setattr(config.pipeline, field_name, value)
+    return f"{name} - {PRESET_NOTES[name]}"
+
+
+# ----------------------------------------------------------------------
 # guards
 # ----------------------------------------------------------------------
 
@@ -481,7 +538,13 @@ class ListenEngine:
                 stable_ms=p.stability_ms,
                 max_words=p.max_words,
             ),
-            drift=DriftController(),
+            drift=DriftController(
+                comfortable_ms=p.drift_comfortable_ms,
+                stretch_ms=p.drift_stretch_ms,
+                aggressive_ms=p.drift_aggressive_ms,
+                max_rate=p.drift_max_rate,
+            ),
+            preroll_ms=p.playback_preroll_ms,
             on_transcript=self._transcript,
             on_degrade=self._degrade,
         )

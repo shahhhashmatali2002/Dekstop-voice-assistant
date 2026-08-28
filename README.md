@@ -162,6 +162,69 @@ capture a chosen process's audio whether or not it is being rendered anywhere.
 PyAudioWPatch does not expose it, so until that is built the source application
 has to render into a cable nobody hears.
 
+### Fluency and lag are one dial
+
+```powershell
+python listen.py                     # fluent, the default for listen mode
+python listen.py --preset balanced   # a compromise
+python listen.py --preset fast       # conversation: short phrases, close to real time
+```
+
+A unit is emitted when the recogniser's text has been stable for
+`stability_ms`, or when it hits `max_words`. Short units reach your ears sooner
+and are synthesised in isolation, so the voice restarts its prosody every few
+words — accurate, and it sounds like someone reading a list. Longer units are
+spoken as whole thoughts, and arrive later. There is no setting that is both.
+
+Three things were making the voice worse than the trade required, all now
+fixed:
+
+- **No jitter cushion.** The render callback drains the ring every period
+  whether or not anything is filling it, and serves an empty ring as silence.
+  Audio is now held for `playback_preroll_ms` before the first sample is
+  released, so a late chunk lands in the cushion instead of punching a hole
+  through the middle of a word.
+- **Playback was serialised.** Synthesis waited for the previous utterance to
+  finish, so the one to two seconds of recognising, translating and
+  synthesising the next unit happened in the silence after it — a pause
+  between every phrase. `_speak` now returns as soon as the first block is
+  audible; the tail plays while the next unit is prepared.
+- **The drift signal was the buffer, not the lag.** Queue depth was read from
+  the sink ring, which the player deliberately keeps full, so it reported a
+  permanent 500 ms of lag and time-stretched every utterance forever — a
+  metallic edge on the voice at all times. It now counts audio still waiting
+  to be written, which is the part that actually means falling behind.
+
+A fourth is the one heard as **half-repeated sentences** — "or an advanced
+student?" then "or an advanced student? Here are the rules." spoken again in
+full. The gate reports end-of-speech at every 400 ms breath; the recogniser
+does not, and keeps extending one hypothesis straight across it. Anything that
+cleared "what we have already spoken" at those breaths — a `segmenter.reset()`
+on speech onset, or a flush that ended the utterance — made the next
+hypothesis arrive as though it were new, and it was spoken from the top with a
+few words added. `_emitted` now survives a VAD pause and is compared word by
+word, ignoring the punctuation the recogniser shuffles around, so a revision
+contributes only what is genuinely new.
+
+A fifth was worse than any of them: the segmenter kept `_emitted` across
+utterances, so `_remainder` compared brand-new speech against an unrelated
+sentence, found no shared prefix and returned nothing. The first utterance of
+a session was translated and **every one after it was silently swallowed**.
+`_emitted` is per-utterance state again; the last utterance's text is kept
+separately, which is what actually stops a duplicated final being spoken
+twice.
+
+Making the queue-depth measurement honest also broke the drop threshold that
+depended on it being dishonest. It could never report more than the sink
+ring's 500 ms, so the 3 s "give up" threshold was unreachable and never fired.
+Against real lag - a cascade genuinely runs three to six seconds behind - the
+same number dropped every single unit and played nothing at all. The defaults
+now match what they mean.
+
+`--console` prints a health line every 15 seconds that tells them apart:
+`stretch` above 1.00 is the metallic one, `dropped` is missing words, `gaps`
+is a stutter inside a word.
+
 ### What to expect
 
 Two to four seconds behind the speaker, dominated by endpointing (§9.3, tune
@@ -184,7 +247,7 @@ so there is nothing faster to switch to.
 | `app/controllers/engine` + `main` | ⚠️ **never executed end to end** |
 | `listen.py` + `app/controllers/listen` | tested, incl. English-in / Urdu-out end to end against fake providers — **real devices and real providers not exercised** |
 
-**222 tests pass:** `pytest`
+**248 tests pass:** `pytest`
 
 ---
 

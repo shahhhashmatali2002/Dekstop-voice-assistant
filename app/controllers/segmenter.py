@@ -96,6 +96,22 @@ def _trim_to_word_boundary(s: str) -> str:
     return s[:idx].rstrip() if idx > 0 else ""
 
 
+def _words(text: str) -> list[str]:
+    """Comparable words: lowercase, stripped of the punctuation ASR moves around."""
+    trailing = ".,!?;:\u06d4\u060c\u061f\u2026\"\u2019'"
+    return [w.strip(trailing).lower() for w in text.split() if w.strip(trailing)]
+
+
+def _starts_with(whole: list[str], prefix: list[str]) -> bool:
+    return len(prefix) <= len(whole) and whole[: len(prefix)] == prefix
+
+
+def _same(a: str, b: str) -> bool:
+    """Two renderings of the same sentence, ignoring trailing punctuation."""
+    trailing = ".!?;:\u06d4\u061f\u2026 "
+    return a.strip().rstrip(trailing).lower() == b.strip().rstrip(trailing).lower()
+
+
 def _last_clause_end(s: str) -> int:
     """Index just past the last clause-ending punctuation, or -1."""
     best = -1
@@ -191,7 +207,8 @@ class Segmenter:
         self.stability = StabilityFilter(min_hypotheses, stable_ms)
         self.max_words = max_words
         self.min_words = min_words
-        self._emitted = ""  # frozen; never revisited
+        self._emitted = ""  # frozen; never revisited - WITHIN one utterance
+        self._last_spoken = ""  # the previous utterance, to catch repeat finals
 
     # ------------------------------------------------------------------
 
@@ -204,7 +221,31 @@ class Segmenter:
         return ""
 
     def reset(self) -> None:
-        """Call at end of utterance, so the next one starts clean."""
+        """Start completely clean. Called when the pipeline stops."""
+        self.stability.reset()
+        self._emitted = ""
+        self._last_spoken = ""
+
+    def _end_utterance(self) -> None:
+        """The speaker finished. Clear per-utterance state, remember the text.
+
+        `_emitted` exists to stop the SAME utterance being spoken twice while
+        the recogniser is still revising it. It is per-utterance state, and
+        carrying it into the next one is not a stricter version of that rule -
+        it is a different rule, and a fatal one: `_remainder` then compares
+        brand-new speech against a sentence that has nothing to do with it,
+        finds no common prefix, and returns nothing. The first utterance of a
+        session is spoken and every utterance after it is silently swallowed.
+
+        What genuinely does need to survive is the last utterance's text, so
+        that a recogniser which sends its final result twice - or a VAD flush
+        landing on top of a final - does not say the same sentence twice.
+        """
+        # Only if something was actually said. An utterance that produced
+        # nothing - a duplicate final, say - must not wipe the guard that
+        # suppressed it, or the third copy gets through.
+        if self._emitted:
+            self._last_spoken = self._emitted
         self.stability.reset()
         self._emitted = ""
 
@@ -222,7 +263,7 @@ class Segmenter:
             if rest:
                 units.append(Unit(rest, "final", hyp.at, hyp.speaker))
                 self._emitted = (self._emitted + " " + rest).strip()
-            self.stability.reset()
+            self._end_utterance()
             return units
 
         stable = self.stability.update(text, hyp.at)
@@ -259,9 +300,17 @@ class Segmenter:
         """
         held = self.stability.latest.strip()
         rest = self._remainder(held)
+        # `_emitted` is NOT cleared here, and that is the whole point of this
+        # method's existence being separate from `_end_utterance`. The VAD and
+        # the recogniser disagree about where an utterance ends, constantly: a
+        # 400 ms breath is silence to the gate, while the recogniser keeps
+        # extending the same hypothesis across it. Forgetting what we already
+        # spoke at every breath means the next hypothesis - which still
+        # contains all of it - gets spoken again from the top, with a few new
+        # words on the end. That is the stutter of half-repeated sentences.
+        self.stability.reset()
         if rest and len(rest.split()) >= 1:
             self._emitted = (self._emitted + " " + rest).strip()
-            self.stability.reset()
             return [Unit(rest, reason)]
         return []
 
@@ -269,27 +318,51 @@ class Segmenter:
     # ------------------------------------------------------------------
 
     def _remainder(self, text: str) -> str:
-        """The part of `text` beyond what has already been emitted."""
+        """The part of `text` we have not already spoken.
+
+        Compared word by word, ignoring punctuation and case, because the
+        recogniser revises both freely while it is still listening -
+        "student" becomes "student?" becomes "student," and none of those is
+        new speech.
+
+        The last branch matters as much as the first. If a hypothesis has
+        nothing in common with what we have spoken, the recogniser has moved
+        on to new speech without ever telling us the old utterance ended.
+        Returning nothing there - on the reasoning that we cannot align it -
+        swallows that sentence, and then every sentence after it.
+        """
         if not text:
             return ""
         text_clean = text.strip()
-        if not self._emitted:
+        emitted = self._emitted.strip()
+
+        if not emitted:
+            # Only the previous utterance arriving twice can suppress this.
+            if self._last_spoken and _same(text_clean, self._last_spoken):
+                return ""
             return text_clean
-        emitted_clean = self._emitted.strip()
 
-        t_norm = text_clean.rstrip(".!?;:۔؟…").lower()
-        e_norm = emitted_clean.rstrip(".!?;:۔؟…").lower()
+        spoken = _words(emitted)
+        words = text_clean.split()
+        heard = _words(text_clean)
 
-        if t_norm == e_norm or t_norm.endswith(e_norm) or e_norm.endswith(t_norm):
+        if heard == spoken or _starts_with(spoken, heard):
+            # Nothing new, or the recogniser retracted. We cannot unsay it.
             return ""
-        if text_clean.startswith(emitted_clean):
-            return text_clean[len(emitted_clean):].strip()
-        if e_norm and t_norm.startswith(e_norm):
-            return text_clean[len(emitted_clean):].strip()
 
-        common = _common_prefix(emitted_clean, text_clean)
-        rem = text_clean[len(common):].strip()
-        if rem.lower().rstrip(".!?;:۔؟…") == t_norm:
-            return ""
-        return rem
+        if _starts_with(heard, spoken):
+            return " ".join(words[len(spoken):]).strip()
 
+        shared = 0
+        for mine, theirs in zip(spoken, heard):
+            if mine != theirs:
+                break
+            shared += 1
+
+        if shared >= 2:
+            # A revision of the same speech: keep our version, take what is new.
+            return " ".join(words[shared:]).strip()
+
+        # Nothing in common. This is different speech, not a revision of ours.
+        self._emitted = ""
+        return text_clean

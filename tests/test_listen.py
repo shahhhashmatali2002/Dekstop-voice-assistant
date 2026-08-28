@@ -18,6 +18,7 @@ sink.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import numpy as np
@@ -139,14 +140,37 @@ class FakeWire:
 
 
 class FakeEndpoint:
-    """Stands in for a CaptureSource or a RenderSink: a real ring, no device."""
+    """Stands in for a CaptureSource or a RenderSink: a real ring, no device.
+
+    A render endpoint can also be told to DRAIN, which is what makes it behave
+    like the hardware: a real WASAPI callback empties the ring every period
+    whether or not anything is filling it. A fake sink that never drains fills
+    up and stays full, which is not a quieter version of reality - it is the
+    opposite of it, and it hides exactly the bugs this file exists to catch.
+    """
 
     def __init__(self, rate: int = 48_000, channels: int = 2) -> None:
         self.rate = rate
         self.channels = channels
-        self.ring = RingBuffer(rate * channels)  # one second
+        self.ring = RingBuffer(rate * channels // 2)  # 500 ms, like RenderSink
         self.written: list[np.ndarray] = []
         self.stopped = False
+        self._draining: threading.Thread | None = None
+
+    def drain_like_hardware(self) -> None:
+        """Consume the ring in real time on a background thread."""
+        if self._draining is not None:
+            return
+
+        def pump() -> None:
+            per_tick = int(self.rate * self.channels * 0.010)
+            buf = np.empty(per_tick, dtype=np.int16)
+            while not self.stopped:
+                self.ring.read_into(buf)
+                time.sleep(0.010)
+
+        self._draining = threading.Thread(target=pump, daemon=True)
+        self._draining.start()
 
     def write(self, pcm: np.ndarray) -> int:
         self.written.append(pcm)
@@ -225,18 +249,26 @@ class FakeTranslator(Translator):
 class FakeTts(TextToSpeech):
     name = "fake-tts"
 
-    def __init__(self, rate: int = 24_000) -> None:
+    def __init__(self, rate: int = 24_000, chunks: int = 3, delay: float = 0.0) -> None:
         self.rate = rate
+        self.chunks = chunks  # each one is 100 ms
+        self.delay = delay    # stands in for a real synthesiser's think time
         self.spoken: list[str] = []
+        self.on_chunk = None  # called with the chunk index before each yield
 
     async def synthesize(self, text: str, voice):
         self.spoken.append(text)
-        for _ in range(3):
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        for index in range(self.chunks):
+            if self.on_chunk is not None:
+                self.on_chunk(index)
             yield PcmChunk(np.zeros(self.rate // 10, dtype=np.int16), self.rate)
+            await asyncio.sleep(0)
         yield PcmChunk(np.empty(0, dtype=np.int16), self.rate, final=True)
 
 
-def build(texts=None, *, asr_fails=False):
+def build(texts=None, *, asr_fails=False, tts_chunks=3, tts_delay=0.0, **pipeline):
     """An engine wired to fakes, plus the parts a test needs to inspect."""
     cfg = Config()
     cfg.listen = ListenConfig(source="CABLE Input", output="Headphones")
@@ -244,9 +276,12 @@ def build(texts=None, *, asr_fails=False):
     # stability window is tested exhaustively in test_pipeline.py.
     cfg.pipeline.stability_hypotheses = 1
     cfg.pipeline.stability_ms = 0.0
+    for key, value in pipeline.items():
+        setattr(cfg.pipeline, key, value)
 
     source = FakeEndpoint()
     output = FakeEndpoint()
+    output.drain_like_hardware()
     wire = FakeWire()
     ports = L.ListenPorts(
         source=source,
@@ -258,7 +293,7 @@ def build(texts=None, *, asr_fails=False):
     providers = {
         "asr": FakeAsr(texts, fail=asr_fails),
         "translator": FakeTranslator(),
-        "tts": FakeTts(),
+        "tts": FakeTts(chunks=tts_chunks, delay=tts_delay),
     }
     events: list[dict] = []
     statuses: list[dict] = []
@@ -619,3 +654,331 @@ def test_cable_scan_recognises_voicemeeter_too():
                          index=3, max_input_channels=0, max_output_channels=2,
                          default_rate=48_000, host_api="Windows WASAPI")]
     assert "IS present" in L.cable_scan(devices)
+
+
+# ----------------------------------------------------------------------
+# fluency: the cushion, the pipelining, and the drift signal
+# ----------------------------------------------------------------------
+
+
+def _ms(pcm: np.ndarray, rate: int = 48_000, channels: int = 2) -> float:
+    return pcm.size / (rate * channels / 1000.0)
+
+
+def test_playback_waits_for_a_cushion_before_the_first_sound(engine_fixture):
+    """The first write must carry the preroll, not the first 100 ms chunk.
+
+    The render callback drains the ring every period whether or not anything
+    is filling it, and serves an empty ring as silence. Handing over the first
+    chunk the moment it arrives therefore means any late chunk is a hole in
+    the middle of a word - heard as a stutter, or as a robotic clip.
+    """
+    engine, ports, providers, *_ = engine_fixture(
+        ["hello"], tts_chunks=8, playback_preroll_ms=400.0
+    )
+    # Each chunk is 100 ms, so nothing may be written until the fifth is asked
+    # for - by which point four have been produced and the cushion is full.
+    seen: list[tuple[int, int]] = []
+    providers["tts"].on_chunk = lambda i: seen.append((i, len(ports.output.written)))
+
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    ports.source.ring.write(loud(400))
+
+    assert wait_for(lambda: ports.output.played_samples > 0)
+    early = [(i, w) for i, w in seen if i <= 3]
+    assert early and all(w == 0 for _, w in early), (
+        f"audio was written before the cushion filled: {early}"
+    )
+    # And it did not hold the whole utterance back either.
+    assert sum(1 for _, w in seen if w > 0) > 0
+
+
+def test_an_utterance_shorter_than_the_cushion_is_still_spoken(engine_fixture):
+    # "kya?" is a whole turn. A cushion that swallows it is a bug, not a buffer.
+    engine, ports, *_ = engine_fixture(
+        ["yes"], tts_chunks=1, playback_preroll_ms=400.0
+    )
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    ports.source.ring.write(loud(400))
+
+    assert wait_for(lambda: ports.output.played_samples > 0), (
+        "a 100 ms utterance never reached the sink"
+    )
+    assert _ms(ports.output.written[0]) > 0
+
+
+def test_speaking_does_not_block_on_the_tail_of_the_utterance(engine_fixture):
+    """Two units must not be serialised behind each other's playback.
+
+    If synthesis waits for the previous utterance to finish, then recognising,
+    translating and synthesising the next one - one to two seconds of it -
+    happens in the silence after it. That pause between every phrase is what
+    "not fluent" sounds like.
+    """
+    engine, ports, providers, *_ = engine_fixture(
+        ["First sentence.", "Second sentence."], tts_chunks=8
+    )
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    ports.source.ring.write(loud(400))
+
+    # Both units reach synthesis well inside the time it would take to play
+    # the first one out (800 ms) twice over.
+    assert wait_for(lambda: len(providers["tts"].spoken) == 2, timeout=2.0), (
+        f"only {providers['tts'].spoken} was synthesised; the second unit was "
+        "waiting for the first to finish playing"
+    )
+
+
+def test_a_full_ring_is_not_mistaken_for_falling_behind():
+    """The bug this encodes: a constant metallic edge on every utterance.
+
+    The sink ring is a fixed half-second buffer the player deliberately keeps
+    full. Reading it as "queue depth" reports a permanent 500 ms of lag, and a
+    drift controller fed that number time-stretches every utterance forever -
+    audible as a metallic edge long before it is audible as speed.
+    """
+    from app.controllers.drift import DriftController
+
+    for name, values in L.PRESETS.items():
+        drift = DriftController(
+            comfortable_ms=values["drift_comfortable_ms"],
+            stretch_ms=values["drift_stretch_ms"],
+            aggressive_ms=values["drift_aggressive_ms"],
+            max_rate=values["drift_max_rate"],
+        )
+        assert drift.decide(500.0).rate == 1.0, (
+            f"preset {name!r} time-stretches a merely-full ring"
+        )
+
+
+def test_the_fluent_preset_leaves_the_voice_alone_for_seconds(engine_fixture):
+    cfg = Config()
+    note = L.apply_preset(cfg, "fluent")
+    assert "video" in note
+    assert cfg.pipeline.drift_comfortable_ms >= 4000.0
+    assert cfg.pipeline.max_words >= 24     # whole thoughts, not phrases
+    assert cfg.pipeline.drift_max_rate <= 1.10  # no audible stretch
+
+
+def test_the_fast_preset_really_is_tighter_than_the_fluent_one():
+    fluent, fast = Config(), Config()
+    L.apply_preset(fluent, "fluent")
+    L.apply_preset(fast, "fast")
+    assert fast.pipeline.stability_ms < fluent.pipeline.stability_ms
+    assert fast.pipeline.max_words < fluent.pipeline.max_words
+    assert fast.pipeline.drift_comfortable_ms < fluent.pipeline.drift_comfortable_ms
+
+
+def test_an_unknown_preset_is_refused_by_name():
+    with pytest.raises(KeyError):
+        L.apply_preset(Config(), "smooth")
+
+
+# ----------------------------------------------------------------------
+# two regressions that produced "no audio at all"
+# ----------------------------------------------------------------------
+
+
+def test_synthesis_never_starves_the_recogniser(engine_fixture):
+    """The Deepgram 1011 bug, encoded.
+
+    Translating and synthesising a unit takes seconds. Both callers that emit
+    units sit on the recognition path, and one of them is the task that feeds
+    audio to the recogniser. Awaiting synthesis inside them stops that feed,
+    and a streaming recogniser does not wait politely: Deepgram closes the
+    socket with 1011 after roughly ten seconds without audio, which the user
+    sees as translation dying part-way through a video.
+    """
+    engine, ports, providers, *_ = engine_fixture(["hello"], tts_delay=1.0)
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    ports.source.ring.write(loud(300))
+
+    # Wait until synthesis is under way and deliberately slow.
+    assert wait_for(lambda: providers["tts"].spoken, timeout=3.0)
+    pushed = providers["asr"].stream.pushed_samples
+
+    # More speech arrives while the synthesiser is still busy.
+    ports.source.ring.write(loud(300))
+    assert wait_for(
+        lambda: providers["asr"].stream.pushed_samples > pushed, timeout=2.0
+    ), "the recogniser was starved of audio while synthesis was running"
+
+
+def test_a_cascade_at_its_normal_lag_is_not_thrown_away():
+    """The "no audio at all" bug, encoded.
+
+    Queue depth used to be read from the sink ring - a fixed half-second
+    buffer - so it could never report more than 500 ms no matter how far
+    behind the pipeline really was, and the 3 s drop threshold was simply
+    unreachable. Once the measurement became the real lag, those same numbers
+    dropped every single unit and played nothing.
+
+    Recognition plus translation plus synthesis genuinely runs three to six
+    seconds behind. That is the normal state of this pipeline, not a fault,
+    and it must not be treated as one.
+    """
+    from app.controllers.drift import DriftController
+
+    p = Config().pipeline
+    drift = DriftController(
+        comfortable_ms=p.drift_comfortable_ms,
+        stretch_ms=p.drift_stretch_ms,
+        aggressive_ms=p.drift_aggressive_ms,
+        max_rate=p.drift_max_rate,
+    )
+    for lag_ms in (3000.0, 4500.0, 6000.0):
+        assert not drift.decide(lag_ms).drop, (
+            f"{lag_ms / 1000:.1f} s of lag - normal for a cascade - is dropped "
+            "by the default settings, so nothing would ever be spoken"
+        )
+    # It must still give up eventually rather than grow without limit.
+    assert drift.decide(30_000.0).drop
+
+
+def test_no_preset_ever_drops_a_normal_cascade_lag():
+    from app.controllers.drift import DriftController
+
+    for name, values in L.PRESETS.items():
+        drift = DriftController(
+            comfortable_ms=values["drift_comfortable_ms"],
+            stretch_ms=values["drift_stretch_ms"],
+            aggressive_ms=values["drift_aggressive_ms"],
+            max_rate=values["drift_max_rate"],
+        )
+        assert not drift.decide(4000.0).drop, f"preset {name!r} drops at 4 s"
+
+
+def test_units_keep_being_spoken_over_a_run(engine_fixture):
+    """Several units in a row must all reach synthesis, not just the first."""
+    engine, ports, providers, *_ = engine_fixture(
+        ["One.", "Two.", "Three.", "Four."]
+    )
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    ports.source.ring.write(loud(400))
+
+    assert wait_for(lambda: len(providers["tts"].spoken) == 4, timeout=5.0), (
+        f"only {len(providers['tts'].spoken)} of 4 units were spoken"
+    )
+    assert ports.output.played_samples > 0
+
+
+def test_every_utterance_of_a_session_is_spoken_not_just_the_first():
+    """The bug that made it fall silent after one sentence.
+
+    `_emitted` stops the SAME utterance being spoken twice while the
+    recogniser is still revising it. Carrying it across utterances is a
+    different rule and a fatal one: `_remainder` compares brand-new speech
+    against a sentence with nothing in common, finds no shared prefix, and
+    returns nothing. One sentence is translated and the rest of the session
+    is silence.
+    """
+    from app.controllers.segmenter import Hypothesis, Segmenter
+
+    seg = Segmenter(min_hypotheses=1, stable_ms=0.0)
+    spoken = []
+    for text in ("Example your grammar.", "Now we begin.", "The third one."):
+        spoken += [u.text for u in seg.push(Hypothesis(text, True, 0.0))]
+    assert spoken == ["Example your grammar.", "Now we begin.", "The third one."]
+
+
+def test_the_same_thing_via_the_vad_flush_path():
+    from app.controllers.segmenter import Hypothesis, Segmenter
+
+    seg = Segmenter(min_hypotheses=1, stable_ms=0.0)
+    spoken = []
+    for utterance in (["Example your", "Example your grammar"],
+                      ["Now we will", "Now we will begin"]):
+        for text in utterance:
+            seg.push(Hypothesis(text, False, 0.0))
+        spoken += [u.text for u in seg.flush()]
+    assert spoken == ["Example your grammar", "Now we will begin"]
+
+
+def test_a_repeated_final_is_still_not_spoken_twice():
+    # What the accumulating `_emitted` was there to prevent, kept.
+    from app.controllers.segmenter import Hypothesis, Segmenter
+
+    seg = Segmenter(min_hypotheses=1, stable_ms=0.0)
+    assert [u.text for u in seg.push(Hypothesis("Hello there.", True, 0.0))]
+    assert seg.push(Hypothesis("Hello there.", True, 0.1)) == []
+    assert seg.push(Hypothesis("Hello there", True, 0.2)) == []  # punctuation
+
+
+# ----------------------------------------------------------------------
+# half-repeated sentences: replayed from a real video
+# ----------------------------------------------------------------------
+
+
+def _replay(script):
+    """Run a recogniser script through a segmenter; return what gets spoken."""
+    from app.controllers.segmenter import Hypothesis, Segmenter
+
+    seg = Segmenter(min_hypotheses=1, stable_ms=0.0)
+    spoken = []
+    for text, final in script:
+        units = seg.flush() if text is None else seg.push(
+            Hypothesis(text, final, 0.0)
+        )
+        spoken += [u.text for u in units]
+    return spoken
+
+
+def test_a_breath_does_not_make_the_sentence_start_again():
+    """Taken verbatim from a session on a real YouTube video.
+
+    The gate reports end-of-speech at every 400 ms breath. The recogniser
+    does not: it keeps extending one hypothesis straight across it. If the
+    segmenter forgets what it has already spoken at each of those breaths,
+    the next hypothesis - which still contains all of it - is spoken again
+    from the top with a few new words on the end. Heard as the same half
+    sentence over and over.
+    """
+    spoken = _replay([
+        ("or an advanced student?", False),
+        (None, None),                       # VAD says the speaker paused
+        ("or an advanced student? Here are the rules.", False),
+        (None, None),
+        ("No pausing the", False),
+        (None, None),
+        ("No pausing the video. No translating.", False),
+    ])
+    assert spoken == [
+        "or an advanced student?",
+        "Here are the rules.",
+        "No pausing the",
+        "video. No translating.",
+    ], f"a phrase was spoken twice: {spoken}"
+
+
+def test_punctuation_the_recogniser_moves_around_is_not_new_speech():
+    # "student" -> "student," -> "student?" is the same word three times.
+    assert _replay([
+        ("are you an intermediate", False),
+        (None, None),
+        ("Are you an intermediate,", False),
+        (None, None),
+        ("are you an intermediate?", False),
+    ]) == ["are you an intermediate"]
+
+
+def test_genuinely_new_speech_still_gets_through():
+    # The failure the repeat-guard must not cause: swallowing everything.
+    assert _replay([
+        ("What is your level of English?", False),
+        (None, None),
+        ("Completely different sentence now.", False),
+    ]) == ["What is your level of English?", "Completely different sentence now."]
+
+
+def test_a_retraction_is_not_spoken_backwards():
+    # The recogniser shortening its guess cannot unsay what we already said.
+    assert _replay([
+        ("I think that is right", False),
+        (None, None),
+        ("I think that is", False),
+    ]) == ["I think that is right"]

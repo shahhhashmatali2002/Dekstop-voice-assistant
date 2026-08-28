@@ -55,6 +55,31 @@ class PipelineConfig:
     max_words: int = 12
     barge_in_confirm_ms: float = 250.0
     suppress_backchannels: bool = True
+
+    #: Synthesised audio held back before playback starts, in milliseconds.
+    #: The render callback consumes the sink ring continuously, so writing a
+    #: TTS chunk the instant it arrives means the first slow chunk on the
+    #: network drains the ring and the listener hears a hole punched through
+    #: the middle of a word. A small buffer absorbs that jitter. It is paid
+    #: once per utterance, not per chunk.
+    playback_preroll_ms: float = 250.0
+
+    #: Drift control (§7.6). The defaults keep a live meeting close to real
+    #: time and are deliberately aggressive: speed up past 400 ms of queue,
+    #: drop past 3 s. Watching a recording wants the opposite trade - see the
+    #: presets in listen.py.
+    #: These were tuned when queue depth was read from the sink ring, which
+    #: is a fixed half-second buffer: the signal could never report more than
+    #: 500 ms however far behind the pipeline actually was, so a 3 s drop
+    #: threshold was unreachable and never fired. The measurement is now the
+    #: real lag, and a cascade through recognition, translation and synthesis
+    #: genuinely sits three to six seconds behind - so the old numbers would
+    #: drop every single unit and play nothing at all. Raised to match what
+    #: they now mean.
+    drift_comfortable_ms: float = 2000.0
+    drift_stretch_ms: float = 6000.0
+    drift_aggressive_ms: float = 12000.0
+    drift_max_rate: float = 1.12
     original_mix_db: float | None = None
 
 
@@ -80,6 +105,11 @@ class ListenConfig:
 
     source: str = ""
     output: str = ""
+    #: Which fluency/lag trade to run at. Listen mode is for watching
+    #: something, where nothing is waiting on you, so whole thoughts spoken a
+    #: few seconds late beat clipped phrases spoken sooner. See PRESETS in
+    #: app/controllers/listen.py.
+    preset: str = "fluent"
     #: Start translating as soon as the window opens, rather than waiting for
     #: Start. Convenient once the routing is set up and never changes.
     autostart: bool = False

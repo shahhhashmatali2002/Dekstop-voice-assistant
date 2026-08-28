@@ -30,6 +30,7 @@ import numpy as np
 
 from app.audio import convert
 from app.audio.formats import RATE_ASR, RATE_S2ST
+from app.controllers.drift import DriftController
 from app.controllers.incoming import IncomingPipeline
 from app.controllers.outgoing import BargeInHandler, OutgoingPipeline
 from app.controllers.vad import VoiceActivityGate
@@ -209,6 +210,13 @@ class Engine:
                 hangover_ms=p.vad_hangover_ms,
                 preroll_ms=p.vad_preroll_ms,
             ),
+            drift=DriftController(
+                comfortable_ms=p.drift_comfortable_ms,
+                stretch_ms=p.drift_stretch_ms,
+                aggressive_ms=p.drift_aggressive_ms,
+                max_rate=p.drift_max_rate,
+            ),
+            preroll_ms=p.playback_preroll_ms,
             on_transcript=self._transcript,
             on_degrade=lambda kind, why: self._degrade(Direction.INCOMING, kind, why),
         )

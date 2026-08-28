@@ -202,6 +202,34 @@ def warn_about_keys(cfg: Config) -> list[str]:
 # ----------------------------------------------------------------------
 
 
+def format_health(snapshot: dict) -> str:
+    """One line that says which of the three fluency problems you have.
+
+    They sound similar and have different fixes, so the numbers matter:
+
+      lag      how far behind the speaker you are, in seconds
+      stretch  1.00 means the voice is untouched; above it the audio is being
+               time-compressed to catch up, heard as a metallic edge
+      dropped  whole sentences thrown away because the lag got out of hand -
+               heard as missing words
+      gaps     ring underruns: the sink ran dry mid-utterance and played
+               silence, heard as a stutter inside a word
+    """
+    inc = snapshot.get("metrics", {}).get("incoming", {})
+    audio = snapshot.get("metrics", {}).get("audio", {})
+    ttfta = (inc.get("ttfta") or {}).get("p50")
+    out = audio.get("output") or {}
+    return (
+        f"  [{snapshot.get('status', '?')}] "
+        f"lag {inc.get('queue_depth_ms', 0) / 1000:.1f}s  "
+        f"stretch {inc.get('drift_rate', 1.0):.2f}x  "
+        f"units {inc.get('units', 0)}  "
+        f"dropped {inc.get('dropped', 0)}  "
+        f"gaps {out.get('underruns', 0)}  "
+        + (f"behind {ttfta / 1000:.1f}s" if ttfta else "")
+    )
+
+
 def run_console(cfg: Config) -> int:
     from app.controllers.listen import ListenEngine
     from app.providers.factory import build_providers
@@ -249,8 +277,14 @@ def run_console(cfg: Config) -> int:
     engine.start()
     engine.start_listening()
     try:
+        # A health line now and then, because "it does not sound right" has
+        # three different causes and they are told apart by these numbers.
+        next_report = time.monotonic() + 15.0
         while True:
             time.sleep(0.5)
+            if time.monotonic() >= next_report:
+                next_report = time.monotonic() + 15.0
+                print(format_health(engine.snapshot()))
     except KeyboardInterrupt:
         print("\n  stopping")
     finally:
@@ -399,6 +433,11 @@ def main() -> int:
     ap.add_argument("--out", metavar="NAME",
                     help="where the Urdu is played; default is the Windows default")
     ap.add_argument("--voice", metavar="NAME", help="Urdu TTS voice")
+    ap.add_argument("--preset", choices=("fluent", "balanced", "fast"),
+                    help="fluency against lag: 'fluent' speaks whole thoughts "
+                         "and runs several seconds behind (video), 'fast' "
+                         "stays close to real time in short phrases "
+                         "(conversation), 'balanced' sits between them")
     ap.add_argument("--autostart", action="store_true",
                     help="begin translating as soon as the window opens")
     ap.add_argument("--allow-capture", action="store_true",
@@ -409,6 +448,15 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = Config.load()
+    from app.controllers.listen import apply_preset
+
+    if args.preset:
+        cfg.listen.preset = args.preset
+    try:
+        print(f"\n  preset: {apply_preset(cfg, cfg.listen.preset)}")
+    except KeyError:
+        cfg.listen.preset = "balanced"
+        print(f"\n  preset: {apply_preset(cfg, 'balanced')}")
     if args.source:
         cfg.listen.source = args.source
     if args.out:
@@ -440,6 +488,7 @@ def main() -> int:
         cfg.save()
         print(f"\n  saved to {Config.path()}")
         print(f"    source  {cfg.listen.source or '(not set)'}")
+        print(f"    preset  {cfg.listen.preset}")
         print(f"    output  {cfg.listen.output or 'system default'}")
         print("\n  Check it resolves:   python listen.py --check")
         print("  Then start it:       python listen.py\n")
