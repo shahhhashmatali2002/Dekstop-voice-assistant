@@ -355,6 +355,24 @@ to be tuned against recordings, not in a live meeting.
 is the number that predicts whether the product works, and it is hidden inside
 the first.
 
+```powershell
+python tools\say.py "ہم نے API کا test کیا"          # writes say.wav
+python tools\say.py --english "The deployment failed."   # translate, then speak
+python tools\say.py --show "YouTube پر 50% servers"   # no audio, just the text
+python tools\say.py --speed 1.1 --voice ur-PK-AsadNeural "کیا حال ہے"
+python tools\say.py --fragment "اور پھر ہم نے دیکھا"   # mid-sentence clause
+```
+
+`say.py` exists because the voice is the one thing that has to be judged by
+ear, and starting the whole pipeline to hear one sentence means routing a
+browser and hoping the line you wanted is the line that comes out.
+
+`--show` prints what the voice will actually be given, after the Urdu
+pronunciation pass — the fastest way to find a word missing from the
+dictionary in `app/providers/urdu_speech.py`. `--speed` is what the drift
+controller asks for when playback is behind: the voice is asked to read
+faster rather than having its output time-stretched afterwards.
+
 ### Hotkeys
 
 Work while Teams has focus, which is the whole point.

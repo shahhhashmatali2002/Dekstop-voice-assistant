@@ -235,7 +235,7 @@ class Segmenter:
         min_hypotheses: int = 3,
         stable_ms: float = 350.0,
         max_words: int = 12,
-        min_words: int = 2,
+        min_words: int = 3,
     ) -> None:
         self.stability = StabilityFilter(min_hypotheses, stable_ms)
         self.max_words = max_words

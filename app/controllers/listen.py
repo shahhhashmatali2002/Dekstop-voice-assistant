@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
+import time
 from dataclasses import dataclass
 
 from app.audio import convert
@@ -397,6 +398,10 @@ class ListenEngine:
         self.on_status = on_status
 
         self._status = IDLE
+        #: When listening began, and whether we have already explained a
+        #: silence - the explanation is worth saying once, not every 10 ms.
+        self._listening_since = 0.0
+        self._said_why = False
         self._detail = ""
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -418,6 +423,12 @@ class ListenEngine:
         return self._status == LISTENING
 
     def _set_status(self, status: str, detail: str = "") -> None:
+        if status != self._status:
+            # Every transition restarts the clock: resuming from a pause
+            # deserves the same explanation as a first start, and a source
+            # that was fine before may not be fine now.
+            self._listening_since = time.monotonic() if status == LISTENING else 0.0
+            self._said_why = False
         self._status = status
         self._detail = detail
         if self.on_status:
@@ -625,11 +636,62 @@ class ListenEngine:
                             )
                         )
                 self._publish_health()
+                self._watch_for_silence()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - must never die
                 self._notice("warning", f"audio pump: {exc}")
             await asyncio.sleep(0.01)
+
+    #: How long to listen before saying that nothing is arriving. Long enough
+    #: that a pause between two sentences is never mistaken for a dead source,
+    #: short enough that a user who has mis-routed the audio is not left
+    #: staring at an empty window wondering whether it is working.
+    SILENCE_NOTICE_S = 12.0
+
+    def _watch_for_silence(self) -> None:
+        """Say why nothing is happening, once, instead of nothing at all.
+
+        Four completely different failures look identical from the outside -
+        an empty transcript - and they have four different fixes. This tells
+        them apart by where the pipeline's counters stop, and says so in the
+        transcript window where the user is already looking.
+        """
+        if self._said_why or self._status != LISTENING or self._pipe is None:
+            return
+        started = self._listening_since
+        if not started or time.monotonic() - started < self.SILENCE_NOTICE_S:
+            return
+
+        pipe = self._pipe
+        source = getattr(self.ports.source_device, "name", "the source")
+
+        # Anything coming back from the recogniser means the whole path works,
+        # whatever the counters before it say, so there is nothing to explain.
+        # Checked first because it is the only one of these that is proof
+        # rather than a threshold.
+        if pipe.hypotheses or pipe.units:
+            return
+
+        if pipe.fed_ms < 500.0:
+            self._notice("warning", (
+                f"Nothing is arriving from {source!r}. The device is open but "
+                "silent, which means no application is playing to it - check "
+                "the app's output in Volume mixer, and that another copy of "
+                "this program is not already holding the device."
+            ))
+        elif pipe.speech_ms < 300.0:
+            self._notice("warning", (
+                f"Audio is arriving from {source!r} but there is no speech in "
+                "it. Either the application is muted, or it is playing to a "
+                "different device than the one we are listening to."
+            ))
+        else:
+            self._notice("warning", (
+                "Speech is reaching the recogniser but nothing is coming back. "
+                "Check the network and DEEPGRAM_API_KEY."
+            ))
+        self._said_why = True
 
     def _publish_health(self) -> None:
         for name, obj in (

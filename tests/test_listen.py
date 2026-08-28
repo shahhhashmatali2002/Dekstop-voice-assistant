@@ -493,7 +493,10 @@ def test_english_in_urdu_out(engine_fixture):
         "no Urdu audio was ever written to the output sink"
     )
     assert providers["translator"].seen == ["The deployment failed."]
-    assert providers["tts"].spoken == ["[ur] The deployment failed."]
+    # The voice is given the line after the Urdu pronunciation pass, which is
+    # why "deployment" arrives in Urdu script here while the transcript above
+    # still carries the original spelling. See app/providers/urdu_speech.
+    assert providers["tts"].spoken == ["[ur] The ڈیپلائمنٹ failed."]
 
     assert events, "nothing was published for the subtitles"
     entry = events[0]
@@ -1650,3 +1653,69 @@ def test_the_settings_dialog_cannot_grow_past_the_screen():
     # The buttons must be added to the dialog, not inside a scroll area.
     fit = ast.dump(methods["_fit_to_screen"])
     assert "availableGeometry" in fit
+
+
+# ----------------------------------------------------------------------
+# saying WHY nothing is happening
+# ----------------------------------------------------------------------
+
+
+def test_a_silent_source_is_explained_rather_than_left_blank(engine_fixture):
+    """The failure the user actually reports: "it is not working". An empty
+    transcript window is the same picture for four unrelated causes, so the
+    engine says which one it is looking at."""
+    engine, ports, providers, events, statuses, notices = engine_fixture([])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+
+    # Nothing is written to the capture ring: the device is open and silent,
+    # which is what a mis-routed application looks like.
+    engine.SILENCE_NOTICE_S = 0.05
+    assert wait_for(lambda: any("Nothing is arriving" in n["message"]
+                                for n in notices), timeout=3.0), (
+        f"the silence was never explained; notices={notices}"
+    )
+
+
+def test_the_explanation_is_given_once_not_every_tick(engine_fixture):
+    engine, ports, providers, events, statuses, notices = engine_fixture([])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    engine.SILENCE_NOTICE_S = 0.05
+    assert wait_for(lambda: notices, timeout=3.0)
+    time.sleep(0.3)          # ~30 pump ticks
+    said = [n for n in notices if "Nothing is arriving" in n["message"]]
+    assert len(said) == 1, f"said it {len(said)} times"
+
+
+def test_audio_that_is_arriving_but_silent_says_so(engine_fixture):
+    """A different fix entirely: the application is muted, or it is playing to
+    a device other than the one we are listening to."""
+    engine, ports, providers, events, statuses, notices = engine_fixture([])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    # Real audio, no speech in it - fed BEFORE the deadline is shortened, so
+    # the pump has actually seen it by the time the watchdog looks.
+    for _ in range(20):
+        ports.source.ring.write(np.zeros(4800, dtype=np.int16))
+        time.sleep(0.01)
+    engine.SILENCE_NOTICE_S = 0.05
+    assert wait_for(lambda: any("no speech in it" in n["message"]
+                                for n in notices), timeout=3.0), (
+        f"notices={notices}"
+    )
+
+
+def test_nothing_is_said_while_words_are_being_recognised(engine_fixture):
+    engine, ports, providers, events, statuses, notices = engine_fixture(
+        ["The deployment failed."]
+    )
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    ports.source.ring.write(loud(400))
+    assert wait_for(lambda: ports.output.played_samples > 0, timeout=5.0)
+    engine.SILENCE_NOTICE_S = 0.05
+    time.sleep(0.2)
+    assert not [n for n in notices if "arriving" in n["message"]], (
+        f"complained while it was working: {notices}"
+    )

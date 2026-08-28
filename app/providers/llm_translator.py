@@ -58,8 +58,11 @@ is unintelligible or empty, return an empty string. A confident invention is \
 worse than a gap.
 3. Speak as the speaker, in the first person. Never "he says that" or "the \
 speaker asks". You ARE the voice.
-4. Natural spoken register: competent, direct, the way a person actually \
-speaks. Not literary, not casual, not stiff.
+4. WRITE FOR THE EAR. This will be spoken aloud, not read. Use the words a \
+Pakistani professional actually says out loud, in natural {target} word \
+order - never a word-for-word mapping of the {source} sentence. Keep clauses \
+short enough to say in one breath. Competent and direct: not literary, not \
+casual, not stiff.
 5. No meta-commentary. No notes, no brackets, no apologies for ambiguity, no \
 alternative renderings. Output the translation and nothing else.
 6. Numbers, dates, quantities and currency: reproduce EXACTLY. Render digits \

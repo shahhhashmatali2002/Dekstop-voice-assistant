@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 import threading
 from dataclasses import dataclass
 
@@ -85,6 +86,10 @@ class Engine:
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._incoming: IncomingPipeline | None = None
+        #: When this stretch of translating began, and whether its silence has
+        #: already been explained.
+        self._translating_since: float | None = None
+        self._said_why = False
         self._outgoing: OutgoingPipeline | None = None
         self._bargein: BargeInHandler | None = None
         self._pump_task: asyncio.Task | None = None
@@ -259,6 +264,8 @@ class Engine:
                 failed.append((Direction.OUTGOING, str(exc)))
 
         self.modes.start()
+        self._translating_since = None
+        self._said_why = False
         # Mute only the wires whose pipeline actually came up. A wire whose
         # pipeline failed must keep passing raw audio (§2.5, §14.1).
         if self._incoming.running:
@@ -273,6 +280,8 @@ class Engine:
         # Connections stay open and warm - resuming must cost nothing (§11.3).
         self.ports.wires.unmute_all()
         self.modes.pause()
+        self._translating_since = None
+        self._said_why = False
 
     async def _stop_translating(self) -> None:
         self.ports.wires.unmute_all()
@@ -284,6 +293,8 @@ class Engine:
         self._outgoing = None
         self._bargein = None
         self.modes.stop()
+        self._translating_since = None
+        self._said_why = False
 
     # ------------------------------------------------------------------
     # the audio pump: rings -> pipelines
@@ -320,11 +331,62 @@ class Engine:
                             )
                         )
                 self._publish_audio_health()
+                self._watch_for_silence()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - must never die
                 self._notice("warning", f"audio pump: {exc}")
             await asyncio.sleep(0.01)
+
+    #: How long to translate before saying that nothing is arriving. See the
+    #: same constant in listen.py - both entry points need this, because the
+    #: failure is in the routing, which neither of them can see.
+    SILENCE_NOTICE_S = 12.0
+
+    def _watch_for_silence(self) -> None:
+        """Say why nothing is happening, once, instead of showing nothing.
+
+        Four unrelated failures produce the same picture - a transcript window
+        that stays empty - and each has a different fix. They are told apart by
+        where the pipeline's counters stop.
+        """
+        pipe = self._incoming
+        if self._said_why or pipe is None or not pipe.running:
+            return
+        if self._translating_since is None:
+            self._translating_since = time.monotonic()
+            return
+        if time.monotonic() - self._translating_since < self.SILENCE_NOTICE_S:
+            return
+
+        source = (
+            getattr(getattr(self.config, "devices", None), "teams_speaker", "")
+            or "the source device"
+        )
+        # Proof beats thresholds: anything back from the recogniser means the
+        # path works and there is nothing to explain.
+        if pipe.hypotheses or pipe.units:
+            return
+
+        if pipe.fed_ms < 500.0:
+            self._notice("warning", (
+                f"Nothing is arriving from {source!r}. The device is open but "
+                "silent, so no application is playing to it - check the app's "
+                "output in Volume mixer, and that another copy of this program "
+                "is not already holding the device."
+            ))
+        elif pipe.speech_ms < 300.0:
+            self._notice("warning", (
+                f"Audio is arriving from {source!r} but there is no speech in "
+                "it. Either the application is muted, or it is playing to a "
+                "different device than the one we are listening to."
+            ))
+        else:
+            self._notice("warning", (
+                "Speech is reaching the recogniser but nothing is coming back. "
+                "Check the network and DEEPGRAM_API_KEY."
+            ))
+        self._said_why = True
 
     def _publish_audio_health(self) -> None:
         for name, obj in (

@@ -36,6 +36,7 @@ from app.models.telemetry import Direction, MetricsBus, TraceFactory, UnitTrace,
 from app.controllers.drift import DriftController, time_stretch
 from app.controllers.segmenter import Hypothesis, Segmenter
 from app.controllers.vad import SpeechEvent, VoiceActivityGate
+from app.providers.urdu_speech import ends_sentence, for_speech
 
 
 @dataclass
@@ -102,6 +103,16 @@ class IncomingPipeline:
         self._running = False
         self._ducked = False
 
+        # Enough to tell the four silences apart. They look identical in the
+        # transcript window - it is empty - and they have completely different
+        # fixes: nothing routed to the device, something routed but muted, a
+        # recogniser that is not answering, and a recogniser that is answering
+        # but has not confirmed a phrase yet.
+        self.fed_ms = 0.0          # audio taken off the capture ring
+        self.speech_ms = 0.0       # of that, what the gate called speech
+        self.hypotheses = 0        # what the recogniser sent back
+        self.units = 0             # phrases confirmed and sent to translate
+
     # ------------------------------------------------------------------
 
     @property
@@ -110,6 +121,7 @@ class IncomingPipeline:
 
     def feed(self, pcm: np.ndarray) -> None:
         """Hand in canonical 16 kHz mono int16. Called from the audio pump."""
+        self.fed_ms += 1000.0 * pcm.size / RATE_ASR
         try:
             self._audio_in.put_nowait(pcm)
         except asyncio.QueueFull:
@@ -198,6 +210,9 @@ class IncomingPipeline:
                 frame = buf[i : i + n]
                 res = self.gate.push(frame)
 
+                if res.speech:
+                    self.speech_ms += 1000.0 * frame.size / RATE_ASR
+
                 if res.event is SpeechEvent.ONSET:
                     # Deliberately NOT segmenter.reset(). The gate reports an
                     # onset after every breath, while the recogniser is still
@@ -247,6 +262,7 @@ class IncomingPipeline:
                     break
                 async for hyp in self._stream.hypotheses():
                     failures = 0
+                    self.hypotheses += 1
                     if self._speaking_trace and not self._speaking_trace.t_hypothesis:
                         self._speaking_trace.mark("hypothesis")
                     for unit in self.segmenter.push(
@@ -293,6 +309,10 @@ class IncomingPipeline:
     def _enqueue(self, unit) -> None:
         """Hand a unit to the worker. Never blocks the caller.
 
+        Counted here rather than in the worker: this is the moment a phrase was
+        confirmed, and the four silences are told apart by where the count
+        stops.
+
         THE RULE THIS EXISTS FOR: nothing on the recognition path may wait on
         the speech path.
 
@@ -304,6 +324,7 @@ class IncomingPipeline:
         ten seconds of silence, which surfaces as translation dying mid-video
         for no visible reason.
         """
+        self.units += 1
         try:
             self._units.put_nowait(unit)
         except asyncio.QueueFull:
@@ -374,7 +395,15 @@ class IncomingPipeline:
         self.context.add("client", unit.text)
         self._emit_transcript(unit.text, translated.text)
 
-        await self._speak(translated.text, trace, decision.rate)
+        # The transcript keeps the translation as written; only the voice gets
+        # the rewritten version - Latin words said in Urdu, and an ending that
+        # matches whether the speaker actually finished the thought. See
+        # app/providers/urdu_speech.
+        spoken = for_speech(
+            translated.text,
+            final=ends_sentence(unit.text, getattr(unit, "reason", "")),
+        )
+        await self._speak(spoken, trace, decision.rate)
 
     async def _speak(self, text: str, trace: UnitTrace, rate: float) -> None:
         """Synthesise one unit and hand it to the player.
@@ -400,6 +429,19 @@ class IncomingPipeline:
         every phrase. So this returns as soon as the first block is actually
         audible - the tail plays while the next unit is being prepared.
         """
+        # Ask the voice to hurry rather than stretching what it has already
+        # said. Per-chunk time-stretching has no state across the seam between
+        # chunks, and a seam every few hundred milliseconds is the metallic
+        # edge users hear as robotic. A neural voice reading faster just sounds
+        # like a person reading faster. The DSP path stays for providers that
+        # cannot be asked (see SpeedHint in app/providers/tts).
+        hinted = False
+        if rate > 1.001 and getattr(self.tts, "supports_speed", False):
+            with contextlib.suppress(Exception):
+                self.tts.set_speed(rate)
+                hinted = True
+                rate = 1.0
+
         first = True
         held: list[np.ndarray] = []
         held_ms = 0.0
@@ -467,6 +509,11 @@ class IncomingPipeline:
             if self.on_degrade:
                 self.on_degrade("impair", f"synthesis unavailable: {exc}")
         finally:
+            # The hint is per utterance. Leaving it set would speed up every
+            # unit after one busy moment.
+            if hinted:
+                with contextlib.suppress(Exception):
+                    self.tts.set_speed(1.0)
             self.metrics.record(trace)
             self._speaking_trace = None
 
