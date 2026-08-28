@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QTabWidget,
@@ -68,7 +70,9 @@ class SettingsDialog(QDialog):
         self.config = config
         self.setWindowTitle("Translator settings")
         self.setMinimumWidth(600)
-        self.setMinimumHeight(560)
+        # No minimum height. A dialog taller than the screen puts Save below
+        # the bottom edge, where it cannot be clicked - the one control the
+        # window exists for. The tabs scroll instead; see `_scrollable`.
         self.setStyleSheet(STYLE)
 
         self._render: list[str] = []
@@ -77,11 +81,11 @@ class SettingsDialog(QDialog):
         self._load_devices()
 
         tabs = QTabWidget(self)
-        tabs.addTab(self._devices_tab(), "Devices")
-        tabs.addTab(self._voices_tab(), "Language and voice")
-        tabs.addTab(self._keys_tab(), "API keys")
-        tabs.addTab(self._hotkeys_tab(), "Hotkeys")
-        tabs.addTab(self._tuning_tab(), "Tuning")
+        tabs.addTab(self._scrollable(self._devices_tab()), "Devices")
+        tabs.addTab(self._scrollable(self._voices_tab()), "Language and voice")
+        tabs.addTab(self._scrollable(self._keys_tab()), "API keys")
+        tabs.addTab(self._scrollable(self._hotkeys_tab()), "Hotkeys")
+        tabs.addTab(self._scrollable(self._tuning_tab()), "Tuning")
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel, self
@@ -93,10 +97,45 @@ class SettingsDialog(QDialog):
         v = QVBoxLayout(self)
         v.setContentsMargins(14, 14, 14, 14)
         v.addWidget(tabs)
-        v.addWidget(buttons)
+        v.addWidget(buttons)  # outside the scroll area: always reachable
+
+    @staticmethod
+    def _scrollable(content: QWidget) -> QScrollArea:
+        """Put a tab's contents in a scroll area.
+
+        The Devices tab is the tallest and grew again with the source picker.
+        A tab that is simply as tall as its contents makes the dialog as tall
+        as its contents, which on a 768-pixel-high laptop screen pushes Save
+        off the bottom of the display. Scrolling the contents keeps the window
+        inside the screen and keeps the buttons where they can be clicked.
+        """
+        area = QScrollArea()
+        area.setWidget(content)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return area
+
+    def _fit_to_screen(self) -> None:
+        """Open at the content's size, but never taller than the display."""
+        screen = QApplication.screenAt(self.pos()) or QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        # Leave room for the title bar and a margin; a window sized to the
+        # exact available area still ends up with its edge under the taskbar
+        # on some setups.
+        height = min(self.sizeHint().height(), int(area.height() * 0.88))
+        width = min(max(self.width(), self.sizeHint().width()), area.width() - 40)
+        self.resize(width, height)
+        self.move(
+            area.left() + (area.width() - width) // 2,
+            area.top() + max(0, (area.height() - height) // 2),
+        )
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
+        self._fit_to_screen()
         # §2.4 - settings is a window like any other and must not appear in a
         # screen share; it shows device names and provider choices.
         capture_guard.harden(self, unfocusable=False)
@@ -141,11 +180,29 @@ class SettingsDialog(QDialog):
             bad.setWordWrap(True)
             v.addWidget(bad)
 
+        what = QGroupBox("What are you translating?")
+        f0 = QFormLayout(what)
+        self.cb_mode = QComboBox()
+        self.cb_mode.addItem(
+            "Something playing on this computer  (a video, a podcast)", "video"
+        )
+        self.cb_mode.addItem("A Teams call  (both directions)", "meeting")
+        index = self.cb_mode.findData(self.config.mode or "video")
+        self.cb_mode.setCurrentIndex(max(0, index))
+        self.cb_mode.currentIndexChanged.connect(self._apply_mode)
+        f0.addRow("Source", self.cb_mode)
+        self.lb_mode_hint = QLabel("")
+        self.lb_mode_hint.setObjectName("hint")
+        self.lb_mode_hint.setWordWrap(True)
+        f0.addRow("", self.lb_mode_hint)
+        v.addWidget(what)
+
         yours = QGroupBox("Your own hardware")
         f1 = QFormLayout(yours)
         self.cb_mic = self._combo(self._capture, d.microphone, "— system default —")
         self.cb_phones = self._combo(self._render, d.headphones, "— system default —")
-        f1.addRow("Microphone", self.cb_mic)
+        self.lb_mic = QLabel("Microphone")
+        f1.addRow(self.lb_mic, self.cb_mic)
         f1.addRow("Headphones", self.cb_phones)
         hint = QLabel(
             "Leave either on system default and Windows decides. Headphones "
@@ -161,18 +218,14 @@ class SettingsDialog(QDialog):
         f2 = QFormLayout(virt)
         self.cb_vmic = self._combo(self._render, d.virtual_mic)
         self.cb_teams = self._combo(self._render, d.teams_speaker)
-        f2.addRow("Write English into", self.cb_vmic)
-        f2.addRow("Teams outputs to", self.cb_teams)
-        note = QLabel(
-            "These two are required - there is no sensible default for them. "
-            "Set the Teams microphone to the "
-            "capture half of the first; set the Teams speaker to the second, "
-            "which we capture so you never hear the original. Turn Teams "
-            "noise suppression off, or it will gate the synthesised speech."
-        )
-        note.setObjectName("hint")
-        note.setWordWrap(True)
-        f2.addRow("", note)
+        self.lb_vmic = QLabel("Write English into")
+        self.lb_teams = QLabel("Teams outputs to")
+        f2.addRow(self.lb_vmic, self.cb_vmic)
+        f2.addRow(self.lb_teams, self.cb_teams)
+        self.lb_cables_note = QLabel("")
+        self.lb_cables_note.setObjectName("hint")
+        self.lb_cables_note.setWordWrap(True)
+        f2.addRow("", self.lb_cables_note)
         v.addWidget(virt)
 
         row = QHBoxLayout()
@@ -182,7 +235,51 @@ class SettingsDialog(QDialog):
         row.addStretch(1)
         v.addLayout(row)
         v.addStretch(1)
+        self._apply_mode()
         return w
+
+    def _apply_mode(self) -> None:
+        """Show only the fields the chosen topology actually uses.
+
+        The two modes need different hardware, and leaving the unused rows
+        active invites exactly the misconfiguration this dialog exists to
+        prevent: a microphone chosen for a session that has no outgoing
+        direction, or a second cable chosen where one endpoint is all that
+        will ever be opened.
+        """
+        video = self.cb_mode.currentData() == "video"
+
+        for widget in (self.cb_mic, self.lb_mic, self.cb_vmic, self.lb_vmic):
+            widget.setEnabled(not video)
+
+        self.lb_teams.setText("Listen to" if video else "Teams outputs to")
+
+        if video:
+            self.lb_mode_hint.setText(
+                "One way: English in, Urdu out of your speakers. Point the "
+                "application you are watching at the cable below - Windows "
+                "Settings › System › Sound › Volume mixer › (the app) › Output "
+                "device - and everything else on the machine is untouched. "
+                "Your microphone is not opened at all."
+            )
+            self.lb_cables_note.setText(
+                "Only this one is used. It has to be a virtual cable: we "
+                "capture whatever it plays, so anything you can hear would be "
+                "captured along with the Urdu we are speaking into it."
+            )
+        else:
+            self.lb_mode_hint.setText(
+                "Both directions. You speak Urdu and the client hears English; "
+                "the client speaks English and you hear Urdu. Needs two cables "
+                "and your microphone."
+            )
+            self.lb_cables_note.setText(
+                "These two are required - there is no sensible default for "
+                "them. Set the Teams microphone to the capture half of the "
+                "first; set the Teams speaker to the second, which we capture "
+                "so you never hear the original. Turn Teams noise suppression "
+                "off, or it will gate the synthesised speech."
+            )
 
     def _refresh(self) -> None:
         self._render.clear()
@@ -360,6 +457,7 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _save(self) -> None:
+        self.config.mode = self.cb_mode.currentData() or "video"
         d = self.config.devices
         d.microphone = self.cb_mic.currentData() or ""
         d.headphones = self.cb_phones.currentData() or ""
@@ -388,8 +486,12 @@ class SettingsDialog(QDialog):
                 set_secret(name, value)
 
         # Only the cables are required; microphone and speakers fall back to
-        # whatever Windows is already using.
-        self.config.setup_complete = bool(d.virtual_mic and d.teams_speaker)
+        # whatever Windows is already using. Video mode uses one cable, so
+        # demanding two would leave it permanently "not configured".
+        if self.config.mode == "video":
+            self.config.setup_complete = bool(d.teams_speaker)
+        else:
+            self.config.setup_complete = bool(d.virtual_mic and d.teams_speaker)
         self.config.save()
         self.applied.emit()
         self.accept()

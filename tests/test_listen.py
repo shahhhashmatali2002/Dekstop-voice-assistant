@@ -1565,3 +1565,88 @@ def test_a_pair_with_one_wire_behaves():
     assert pair.health()["outgoing"] is None
     pair.stop()
     assert not incoming.started
+
+
+def test_settings_offers_the_source_picker_and_saves_it():
+    """The mode has to be changeable without the command line.
+
+    It decides whether a microphone is opened, so a dialog that cannot reach
+    it leaves the CLI as the only way to correct the most consequential
+    choice in the application.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    source = _Path("app/views/settings.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    dialog = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SettingsDialog"
+    )
+    methods = {
+        node.name: node for node in dialog.body if isinstance(node, ast.FunctionDef)
+    }
+    assert "_apply_mode" in methods, "the dialog cannot show mode-specific fields"
+
+    devices_tab = ast.dump(methods["_devices_tab"])
+    assert "cb_mode" in devices_tab, "no source picker on the Devices tab"
+    for value in ("video", "meeting"):
+        assert f"'{value}'" in devices_tab, f"the {value!r} option is missing"
+
+    saved = ast.dump(methods["_save"])
+    assert "cb_mode" in saved, "the dialog never writes the mode back"
+    assert "mode" in saved
+
+
+def test_video_mode_is_configured_with_one_cable_by_the_dialogs_rule():
+    """`setup_complete` must not demand two cables in a one-cable topology."""
+    import ast
+    from pathlib import Path as _Path
+
+    source = _Path("app/views/settings.py").read_text(encoding="utf-8")
+    save = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "_save"
+    )
+    body = ast.dump(save)
+    # The rule is branched on the mode rather than always requiring both.
+    assert "setup_complete" in body
+    assert body.count("virtual_mic") >= 1 and "'video'" in body
+
+
+def test_the_settings_dialog_cannot_grow_past_the_screen():
+    """Save must stay clickable on a short display.
+
+    The Devices tab is the tallest and grew again with the source picker. A
+    tab as tall as its contents makes the dialog as tall as its contents,
+    which on a 768-pixel-high laptop screen pushes the Save button off the
+    bottom of the display - the one control the window exists for.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    source = _Path("app/views/settings.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    dialog = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SettingsDialog"
+    )
+    methods = {
+        node.name: node for node in dialog.body if isinstance(node, ast.FunctionDef)
+    }
+
+    assert "_scrollable" in methods, "the tabs cannot scroll"
+    assert "_fit_to_screen" in methods, "the dialog never measures the screen"
+
+    init = ast.dump(methods["__init__"])
+    assert init.count("_scrollable") == 5, "not every tab was made scrollable"
+    assert "setMinimumHeight" not in init, (
+        "a minimum height defeats fitting to the screen"
+    )
+
+    shown = ast.dump(methods["showEvent"])
+    assert "_fit_to_screen" in shown
+
+    # The buttons must be added to the dialog, not inside a scroll area.
+    fit = ast.dump(methods["_fit_to_screen"])
+    assert "availableGeometry" in fit

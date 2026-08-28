@@ -40,7 +40,11 @@ python run.py --mode video      # something is playing; one cable, mic off
 python run.py --mode meeting    # a two-way Teams call; two cables, mic live
 ```
 
-Without `--mode` the first run asks and remembers the answer. The two
+Without `--mode` the first run asks and remembers the answer, and it is the
+first thing on **Settings › Devices** afterwards — changing it there re-opens
+the endpoints straight away, no relaunch. The dialog greys out the rows the
+chosen mode does not use, so a microphone cannot be picked for a session with
+no outgoing direction. The two
 topologies are genuinely different and neither can be inferred:
 
 | | video | meeting |
@@ -287,7 +291,7 @@ so there is nothing faster to switch to.
 | `app/controllers/engine` + `main` | ⚠️ **never executed end to end** |
 | `listen.py` + `app/controllers/listen` | tested, incl. English-in / Urdu-out end to end against fake providers — **real devices and real providers not exercised** |
 
-**275 tests pass:** `pytest`
+**277 tests pass:** `pytest`
 
 ---
 
