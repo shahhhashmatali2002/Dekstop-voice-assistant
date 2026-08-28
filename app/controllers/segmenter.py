@@ -148,6 +148,7 @@ class StabilityFilter:
         self._window: deque[str] = deque(maxlen=self.min_hypotheses)
         self._prefix = ""
         self._since = 0.0
+        self._history: list[tuple[str, float]] = []
         self._latest = ""
 
     @property
@@ -175,21 +176,53 @@ class StabilityFilter:
         if not _ends_at_word_boundary(prefix, self._window):
             prefix = _trim_to_word_boundary(prefix)
 
-        if prefix != self._prefix:
-            self._prefix = prefix
-            self._since = at
+        if not prefix:
+            return self._prefix
 
-        # A freshly-changed prefix still has to hold for stable_ms. With
-        # stable_ms == 0 it is confirmed immediately, which is what the tests
-        # and the replay tool rely on.
-        if (at - self._since) * 1000.0 < self.stable_ms:
-            return ""
+        # AN EXTENSION IS NOT A CHANGE.
+        #
+        # This is the distinction the filter used to miss, and missing it made
+        # it silent. "the prefix changed, so restart the clock" treats
+        #
+        #     "Hey welcome back"  ->  "Hey welcome back so today"
+        #
+        # as a disagreement. It is not: every word in the first is still
+        # agreed, and has been agreed for LONGER. But hypotheses arrive every
+        # few hundred milliseconds and each one extends the prefix, so the
+        # clock restarted on every single one and `at - _since` was always
+        # zero. Nothing was ever confirmed while somebody kept talking: 61
+        # words of continuous speech produced no units at all, and the only
+        # line that came out was the one the VAD flushed at the first pause.
+        #
+        # So the clock belongs to each prefix separately. A word is confirmed
+        # once it has been in the common prefix for `stable_ms`, whatever has
+        # been appended after it since.
+        if self._history and not prefix.startswith(self._history[-1][0]):
+            # A genuine revision - the recogniser changed a word it had
+            # already agreed on. Nothing is confirmed until this settles.
+            self._history = [(prefix, at)]
+            self._prefix = ""
+        elif not self._history or prefix != self._history[-1][0]:
+            self._history.append((prefix, at))
+
+        deadline = at - self.stable_ms / 1000.0
+        for candidate, first_seen in self._history:
+            if first_seen <= deadline and len(candidate) > len(self._prefix):
+                self._prefix = candidate
+                self._since = first_seen
+
+        # A long utterance would otherwise keep one entry per hypothesis.
+        # Older entries are shorter, and a longer confirmed prefix supersedes
+        # them.
+        if len(self._history) > 64:
+            del self._history[:-32]
         return self._prefix
 
     def reset(self) -> None:
         self._window.clear()
         self._prefix = ""
         self._since = 0.0
+        self._history: list[tuple[str, float]] = []
         self._latest = ""
 
 

@@ -19,7 +19,6 @@ first 200 ms of audio beats one that takes 250 ms to produce all of it.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 from typing import AsyncIterator
 
@@ -42,6 +41,31 @@ AZURE_URDU_VOICES = (
     "ur-IN-GulNeural",
     "ur-IN-SalmanNeural",
 )
+
+
+def speakable(text: str) -> str:
+    """Tidy a line so a neural voice reads it as speech.
+
+    Two things matter to how fluent the result sounds, and both are about
+    what the voice is given rather than which voice it is:
+
+    A sentence with no final punctuation is read flat and clipped - the voice
+    has no way to know the thought ended, so it does not fall at the end. The
+    translator is told not to invent closing punctuation the speaker did not
+    imply, which is right for the text and wrong for the speech, so it is
+    added here instead.
+
+    And the marks a text renderer treats as decoration are instructions to a
+    speech engine: a stray quote or bracket becomes a pause in the middle of
+    a phrase.
+    """
+    clean = " ".join((text or "").split())
+    if not clean:
+        return ""
+    clean = clean.strip("\"'\u201c\u201d\u2018\u2019()[]")
+    if clean and clean[-1] not in ".!?۔؟…,،:;":
+        clean += "۔"
+    return clean
 
 
 def _xml_escape(s: str) -> str:
@@ -292,8 +316,14 @@ class EdgeTextToSpeech(TextToSpeech):
     #: frame (1152 samples).
     TAIL_GUARD = 2_304
 
-    def __init__(self, rate: int = 24_000) -> None:
+    #: Spoken a little under the default. Edge's neural voices read at a
+    #: brisk pace that is fine for a caption being read aloud and hurried for
+    #: a language the listener is relying on to follow a conversation.
+    SPEAKING_RATE = "-8%"
+
+    def __init__(self, rate: int = 24_000, speaking_rate: str | None = None) -> None:
         self.rate = rate
+        self.speaking_rate = speaking_rate or self.SPEAKING_RATE
 
     def _decode(self, mp3: bytes):
         """Seam: overridden in tests so the streaming logic can be exercised."""
@@ -311,7 +341,9 @@ class EdgeTextToSpeech(TextToSpeech):
         except ImportError as exc:
             raise ProviderMisconfigured("pip install edge-tts") from exc
 
-        comm = edge_tts.Communicate(text, voice_name)
+        comm = edge_tts.Communicate(
+            speakable(text), voice_name, rate=self.speaking_rate
+        )
         async for chunk in comm.stream():
             if chunk["type"] == "audio":
                 yield chunk["data"]

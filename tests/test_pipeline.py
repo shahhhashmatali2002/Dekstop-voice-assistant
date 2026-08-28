@@ -470,3 +470,83 @@ def test_trace_factory_ids_increase_per_direction():
 
 def test_trace_factory_stamps_onset():
     assert TraceFactory().new(Direction.INCOMING).t_speech_onset > 0
+
+
+# ======================================================================
+# the filter that went silent
+# ======================================================================
+
+
+def test_a_growing_prefix_is_confirmed_while_the_speaker_keeps_talking():
+    """The bug: one line translated in 37 seconds of a podcast.
+
+    "The prefix changed, so restart the clock" treats
+
+        "Hey welcome back"  ->  "Hey welcome back so today"
+
+    as a disagreement. It is not: every word in the first is still agreed,
+    and has been agreed for LONGER. But hypotheses arrive every few hundred
+    milliseconds and each extends the prefix, so the clock restarted on every
+    one and nothing was ever confirmed while somebody kept talking.
+    """
+    s = StabilityFilter(min_hypotheses=3, stable_ms=300)
+    words = "so today we are going to talk about listening".split()
+
+    confirmed = ""
+    for index in range(1, len(words) + 1):
+        confirmed = s.update(" ".join(words[:index]), index * 0.35)
+
+    assert confirmed, "the filter confirmed nothing across nine hypotheses"
+    assert confirmed.split()[0] == "so"
+
+
+def test_continuous_speech_produces_units_without_waiting_for_a_pause():
+    """End to end: a monologue with no full stops and no gaps.
+
+    Sixty-one words of it used to produce zero units - the only line that
+    ever came out was the one the VAD flushed at the first pause.
+    """
+    words = ("Hey welcome back so today we are going to talk about something "
+             "that a lot of you have been asking me about and it is one of "
+             "those topics that comes up again and again whenever people talk "
+             "about learning a language so what is it well it is listening").split()
+
+    seg = Segmenter(min_hypotheses=3, stable_ms=300.0, max_words=12)
+    spoken = []
+    for index in range(1, len(words) + 1):
+        for unit in seg.push(
+            Hypothesis(" ".join(words[:index]), False, index * 0.35)
+        ):
+            spoken.append(unit)
+
+    assert len(spoken) >= 4, (
+        f"{len(words)} words of continuous speech produced only "
+        f"{len(spoken)} units"
+    )
+    # And nothing is said twice.
+    joined = " ".join(u.text for u in spoken).split()
+    assert joined == words[:len(joined)], "a phrase was repeated or reordered"
+
+
+def test_the_first_unit_arrives_within_a_few_seconds():
+    words = ("Hey welcome back so today we are going to talk about listening "
+             "and how it changes everything about learning a language").split()
+    seg = Segmenter(min_hypotheses=3, stable_ms=300.0, max_words=12)
+
+    first_at = None
+    for index in range(1, len(words) + 1):
+        at = index * 0.35
+        if seg.push(Hypothesis(" ".join(words[:index]), False, at)):
+            first_at = at
+            break
+
+    assert first_at is not None, "no unit was ever emitted"
+    assert first_at <= 10.0, f"the first unit took {first_at:.1f}s"
+
+
+def test_a_revision_still_holds_everything_back_until_it_settles():
+    # The behaviour the extension fix must not break.
+    s = StabilityFilter(min_hypotheses=2, stable_ms=350)
+    s.update("I think we should change", 0.0)
+    s.update("I think we should change", 0.5)
+    assert s.update("I think we should charge", 0.6) == ""

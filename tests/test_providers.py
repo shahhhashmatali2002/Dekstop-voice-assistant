@@ -392,3 +392,156 @@ def test_get_secret_loads_from_env_file(tmp_path, monkeypatch):
     monkeypatch.delenv("TEST_SECRET_KEY", raising=False)
     assert get_secret("TEST_SECRET_KEY") == "secret_val_123"
 
+
+
+# ----------------------------------------------------------------------
+# dropped sentences
+# ----------------------------------------------------------------------
+
+
+def test_the_prompt_demands_every_sentence():
+    """Observed verbatim: five sentences in, one sentence out.
+
+        "Hey, welcome back. I'm David. And I'm Alice. Hello, everyone. So Alice,"
+     -> "ہیلو، سب کو۔ تو ایلس،"
+
+    Told it was an interpreter working "one fragment at a time", the model
+    treated a multi-sentence unit as one fragment and rendered only the tail.
+    A dropped sentence is invisible to the listener: they cannot know
+    something was said.
+    """
+    from app.providers.llm_translator import SYSTEM_PROMPT
+
+    lowered = SYSTEM_PROMPT.lower()
+    assert "every sentence" in lowered
+    assert "never summarise" in lowered or "never summarize" in lowered
+    assert "only the last part" in lowered
+    # And the framing that caused it is gone.
+    assert "one fragment at a time" not in lowered
+
+
+def test_names_are_not_dropped_either():
+    from app.providers.llm_translator import SYSTEM_PROMPT
+
+    assert "transliterate" in SYSTEM_PROMPT.lower()
+
+
+def test_a_reply_that_lost_most_of_the_input_is_detected():
+    from app.providers.llm_translator import looks_truncated
+
+    english = ("Hey, welcome back. I'm David. And I'm Alice. Hello, everyone. "
+               "So Alice,")
+    assert looks_truncated(english, "ہیلو، سب کو۔ تو ایلس،")
+
+
+def test_a_complete_reply_is_left_alone():
+    from app.providers.llm_translator import looks_truncated
+
+    english = ("Hey, welcome back. I'm David. And I'm Alice. Hello, everyone. "
+               "So Alice,")
+    full = ("ارے، واپس آنے پر خوش آمدید۔ میں ڈیوڈ ہوں۔ اور میں ایلس ہوں۔ "
+            "ہیلو، سب کو۔ تو ایلس،")
+    assert not looks_truncated(english, full)
+
+
+def test_short_inputs_are_exempt():
+    """"Yes." legitimately becomes one word; ratios on four words are noise."""
+    from app.providers.llm_translator import looks_truncated
+
+    assert not looks_truncated("Yes.", "جی ہاں۔")
+    assert not looks_truncated("No pausing the video.", "ویڈیو نہ روکیں۔")
+
+
+def test_an_empty_reply_is_not_treated_as_truncation():
+    # Rule 2 lets the model return nothing rather than invent; retrying that
+    # would be arguing with a deliberate refusal.
+    from app.providers.llm_translator import looks_truncated
+
+    assert not looks_truncated("Some long sentence that has many words in it", "")
+
+
+def test_a_single_clause_is_never_retried():
+    """The regression this prevents: every unit paying for a second round trip.
+
+    A retry costs a full round trip, and a round trip is latency the listener
+    hears. A single clause cannot have dropped a sentence, and terse is often
+    correct - Urdu says "کیوں؟" for "So why is that, then?" - so the check
+    only ever looks at multi-sentence input.
+    """
+    from app.providers.llm_translator import looks_truncated
+
+    assert not looks_truncated("So why is that, then, in your view", "کیوں؟")
+    assert not looks_truncated(
+        "and how naturally you can use English in conversation",
+        "اور آپ انگریزی کتنی قدرتی طور پر استعمال کر سکتے ہیں",
+    )
+
+
+def test_sentences_are_counted_in_both_scripts():
+    from app.providers.llm_translator import sentence_count
+
+    assert sentence_count("One. Two. Three.") == 3
+    assert sentence_count("ایک۔ دو۔ تین۔") == 3
+    assert sentence_count("What? Really!") == 2
+    assert sentence_count("no punctuation at all") == 1
+    assert sentence_count("") == 0
+
+
+def test_losing_half_the_sentences_is_what_triggers_the_retry():
+    from app.providers.llm_translator import looks_truncated
+
+    four = "One thing. Two things. Three things. Four things happened today."
+    assert looks_truncated(four, "چار چیزیں ہوئیں۔")
+    assert not looks_truncated(
+        four, "ایک چیز۔ دو چیزیں۔ تین چیزیں۔ آج چار چیزیں ہوئیں۔"
+    )
+
+
+# ----------------------------------------------------------------------
+# what the voice is given to say
+# ----------------------------------------------------------------------
+
+
+def test_a_dangling_clause_is_given_an_ending():
+    """A sentence with no final mark is read flat: the voice cannot know the
+    thought ended, so it does not fall at the end. The translator is told not
+    to invent punctuation the speaker did not imply - right for the text,
+    wrong for the speech."""
+    from app.providers.tts import speakable
+
+    assert speakable("آپ کی انگریزی کا معیار").endswith("۔")
+
+
+def test_punctuation_that_is_already_there_is_left_alone():
+    from app.providers.tts import speakable
+
+    for ending in ("۔", "؟", "!", ".", ","):
+        text = "کچھ بات" + ending
+        assert speakable(text) == text
+
+
+def test_stray_marks_that_become_pauses_are_removed():
+    from app.providers.tts import speakable
+
+    assert speakable('"ہیلو"') == "ہیلو۔"
+    assert speakable("(ہیلو)") == "ہیلو۔"
+
+
+def test_runs_of_whitespace_are_collapsed():
+    from app.providers.tts import speakable
+
+    assert speakable("  ہیلو\n\n  دنیا  ") == "ہیلو دنیا۔"
+
+
+def test_nothing_in_nothing_out():
+    from app.providers.tts import speakable
+
+    assert speakable("") == ""
+    assert speakable("   ") == ""
+
+
+def test_the_voice_is_asked_to_slow_down_a_little():
+    from app.providers.tts import EdgeTextToSpeech
+
+    assert EdgeTextToSpeech().speaking_rate.startswith("-")
+    assert EdgeTextToSpeech(speaking_rate="+0%").speaking_rate == "+0%"
