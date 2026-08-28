@@ -15,7 +15,8 @@ audio endpoints it is pointed at.
 ```
 VoiceAssistant/
 ├── run.py                  <- meeting mode: two way, Teams
-├── listen.py               <- listen mode: one way, any application
+├── listen.py               <- listen mode: one way, any application, live
+├── pretranslate.py         <- recorded video: prepared ahead, in sync
 ├── requirements.txt
 ├── app/
 │   ├── models/             state, config, terminology, telemetry
@@ -278,6 +279,49 @@ you can follow the gap. In a live call that lag is the price of the cascade —
 Urdu is not an available output language for any speech-to-speech model (§8.2),
 so there is nothing faster to switch to.
 
+---
+
+## Pre-translated playback: Urdu in sync
+
+```powershell
+pip install youtube-transcript-api
+python pretranslate.py "https://www.youtube.com/watch?v=..."
+```
+
+Live translation is always behind the picture, and that is a property of time
+rather than a shortfall in the engineering: a sentence has to be spoken before
+it can be translated, Urdu puts the verb where English does not, and then
+recognition, translation and synthesis each take their turn. Three seconds is
+the floor. Teams and Windows both ship *captions* rather than spoken
+translation for the same reason.
+
+**A recording has a future.** Its words already exist before you press play, so
+this mode does not stream at all:
+
+1. it reads the whole caption track and joins the fragments into sentences;
+2. it translates every sentence with the rest of the video for context;
+3. it synthesises all the Urdu;
+4. **then** playback starts, each line fired at the timestamp it belongs to.
+
+Nothing is being waited for during playback, so nothing is behind. The Urdu
+lands where the English was. It also reads better than the live path, because
+no sentence is translated as a fragment.
+
+```powershell
+python pretranslate.py URL --start 1:30     # resuming mid-video
+python pretranslate.py URL --offset -0.4    # consistently late, nudge it
+python pretranslate.py URL --out "Headset"  # where the Urdu is played
+```
+
+The original English is silenced exactly as in listen mode - point the browser
+at the cable. The cable is only used to make the English inaudible here;
+nothing is captured, so there is no loopback and no recogniser.
+
+**What it cannot do:** anything live. A Teams call has no future to read ahead
+into, so that stays on the live path and stays a few seconds behind. And a
+video with captions disabled cannot be prepared this way — transcribing the
+audio ahead of playback would work and is not built.
+
 ## What is built
 
 | Layer | Verified? |
@@ -289,9 +333,10 @@ so there is nothing faster to switch to.
 | `app/audio` devices, streams, passthrough | ⚠️ **never executed — needs Windows** |
 | `app/views` | renders correctly; focus and capture behaviour **need Windows** |
 | `app/controllers/engine` + `main` | ⚠️ **never executed end to end** |
+| `pretranslate.py` + `app/controllers/pretranslate` | tested: the merge, the context, the clock, the offset, the format conversion — **captions and providers are network paths, not exercised** |
 | `listen.py` + `app/controllers/listen` | tested, incl. English-in / Urdu-out end to end against fake providers — **real devices and real providers not exercised** |
 
-**277 tests pass:** `pytest`
+**301 tests pass:** `pytest`
 
 ---
 

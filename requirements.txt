@@ -24,3 +24,9 @@ pytest>=8.0
 # comtypes>=1.2         # device notifications
 # pycaw>=20240210       # endpoint IDs (replaces the name-matching in devices.py)
 # keyring>=25.0         # Windows Credential Manager
+
+# Pre-translated playback (pretranslate.py). Captions only - the
+# timing comes from YouTube's own alignment, which is what that mode
+# needs; wording is fixed by translating whole sentences.
+# youtube-transcript-api>=0.6
+# edge-tts, miniaudio    - free neural TTS, used when no Azure key is set
