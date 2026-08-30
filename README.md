@@ -144,6 +144,28 @@ python listen.py --check
 
 ### 5. Route the audio
 
+The application does this for you now. While it is translating, the machine's
+default output is the virtual cable — so whatever is playing is captured — and
+the Urdu is played to your real speakers, which the app opens **by name** and
+so is never affected. When you press Stop, close the window, or it crashes, the
+default goes straight back to what it was.
+
+```powershell
+.venv\Scripts\python -m pip install pycaw comtypes
+```
+
+Without those two packages it falls back to telling you to do it by hand, which
+is the rest of this section. Turn the automatic routing off with
+`devices.auto_route = false` in the config if you would rather do it yourself.
+
+One consequence worth knowing: while it runs, *every* sound follows the default
+into the cable — notifications, another app's audio — so those are translated
+along with the video instead of being played. That is the same thing that
+happens when you route the browser by hand, applied more widely.
+
+**Doing it by hand instead:**
+
+
 This is the step that makes you hear **only** Urdu, and it is manual because
 Windows has no API to move another application's audio.
 
@@ -362,6 +384,46 @@ python tools\say.py --show "YouTube پر 50% servers"   # no audio, just the tex
 python tools\say.py --speed 1.1 --voice ur-PK-AsadNeural "کیا حال ہے"
 python tools\say.py --fragment "اور پھر ہم نے دیکھا"   # mid-sentence clause
 ```
+
+```powershell
+.venv\Scripts\python -m pip install torch torchaudio     # once
+.venv\Scripts\python tools\clone_bench.py --from-audio clip.mp3
+.venv\Scripts\python tools\clone_bench.py --from-video "https://youtu.be/..."
+```
+
+Use `.venv\Scripts\python -m pip`, not bare `pip`: a bare `pip` on Windows
+often resolves to the system Python instead of this project's virtual
+environment, and reports it as *"Defaulting to user installation because normal
+site-packages is not writeable"* while installing somewhere the application
+will never look.
+
+The default backend is **kNN-VC**, which needs only `torch`, `torchaudio` and
+any numpy. Do not use `seed-vc` on Python 3.13: it pins numpy below 2.0, that
+has no wheel for 3.13, and pip falls back to compiling numpy from source and
+then fails asking for a C compiler.
+
+In the desktop app it is a flag, and the voice is learned from the audio as it
+plays - there is no file to read ahead into on a live source:
+
+```powershell
+python run.py --clone-voice
+```
+
+The first half-minute comes out in the normal voice while it listens to the
+speaker; after that the translation is spoken in their voice. The app measures
+conversion speed at startup and **declines the feature** if this machine is too
+slow, saying so in the transcript window rather than falling further behind for
+the rest of the video. On a CPU it will almost certainly decline: converting a
+four-second sentence at 0.35x costs 1.4 seconds on top of the lag that is
+already there, and that is the ceiling.
+
+`clone_bench.py` answers one question with a number: how many seconds of
+compute one second of audio costs on **this** machine. Below 1.0, voice
+conversion can run while a video plays; between 1 and 4, a recording has to be
+prepared before playback; above 4, a forty-minute video takes longer to prepare
+than to watch. It writes `clone_before.wav` and `clone_after.wav` so the
+quality can be judged by ear before anything is wired in. Run it before using
+`pretranslate.py --clone-voice`.
 
 `say.py` exists because the voice is the one thing that has to be judged by
 ear, and starting the whole pipeline to hear one sentence means routing a

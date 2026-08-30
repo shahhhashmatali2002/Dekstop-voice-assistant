@@ -7,8 +7,13 @@ by ear rather than by spec sheet:
 
   * Azure Neural TTS  - ur-PK-UzmaNeural (female), ur-PK-AsadNeural (male).
     Correct locale for a Pakistani listener.
-  * ElevenLabs Flash v2.5 - ~75 ms model latency, 32 languages including Urdu.
-    Attractive latency; naturalness must be judged by native listeners.
+  * ElevenLabs Flash v2.5 - ~75 ms model latency, 32 languages, and NOT one of
+    them is Urdu. Checked against their language support page in August 2026:
+    Urdu appears only in Eleven v3, and Professional Voice Cloning is aligned
+    to Flash v2.5's list, so a cloned Urdu voice is not available there either.
+    The implementation stays because the latency is worth having the moment
+    that changes, and because it is the right shape for any other target
+    language - but it must not be presented as an Urdu option today.
 
 WHAT MATTERS HERE IS TIME TO FIRST CHUNK, NOT TOTAL TIME
 --------------------------------------------------------

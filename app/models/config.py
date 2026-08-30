@@ -32,6 +32,10 @@ class DeviceConfig:
     virtual_mic: str = ""  # the render half we write English into
     teams_speaker: str = ""  # the render half Teams outputs to; we loopback it
 
+    #: Let the application do the routing: while translating, the machine's
+    #: default output is the cable, so whatever is playing is captured without
+    #: anybody opening the volume mixer. Put back on stop and on exit.
+    auto_route: bool = True
 
 @dataclass
 class ProviderConfig:
@@ -42,6 +46,20 @@ class ProviderConfig:
     urdu_voice: str = "ur-PK-UzmaNeural"
     translator_model: str = "gpt-4o-mini"
     region: str = ""
+
+    #: Speak the Urdu in the voice of whoever is speaking on the source, by
+    #: converting the synthesised audio onto a reference learned from the live
+    #: audio. Off by default: it is the only feature here that wants a GPU, and
+    #: on a machine too slow for it the engine refuses rather than falling
+    #: behind - see clone_max_factor.
+    clone_voice: bool = False
+    clone_backend: str = "knn"
+
+    #: The most compute per second of audio that may be spent converting before
+    #: the feature is declined at startup. A whole utterance is converted
+    #: before any of it is audible, so this is added directly to the lag: at
+    #: 0.35, a four-second sentence costs 1.4 seconds more than it does now.
+    clone_max_factor: float = 0.35
 
 
 @dataclass

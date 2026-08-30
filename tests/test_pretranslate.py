@@ -593,3 +593,89 @@ def test_the_player_waits_rather_than_skipping_when_preparation_lags():
 
     asyncio.run(drive())
     assert spoken == [0.2], "a late-prepared line was dropped"
+
+
+# ----------------------------------------------------------------------
+# speaking in the video's own voice
+# ----------------------------------------------------------------------
+
+
+class FakeConverter:
+    """Records what it was asked to convert, and marks the audio it returns."""
+
+    def __init__(self, fail: bool = False, realtime_factor: float = 0.2) -> None:
+        self.calls: list[tuple[int, float]] = []
+        self.fail = fail
+        self.realtime_factor = realtime_factor
+
+    def convert(self, pcm, rate, reference):
+        self.calls.append((pcm.size, reference.seconds))
+        if self.fail:
+            raise ProviderError("the converter fell over")
+        return np.full(pcm.size, 7, dtype=np.int16), rate
+
+
+def test_each_line_is_converted_to_the_reference_voice():
+    from app.controllers.pretranslate import prepare, Cue
+    from app.providers.voice_clone import Reference
+
+    cues = [Cue(0.0, 2.0, "Hello there."), Cue(3.0, 5.0, "And welcome back.")]
+    converter = FakeConverter()
+    reference = Reference(np.zeros(24_000 * 10, dtype=np.int16), 24_000)
+
+    lines = asyncio.run(prepare(
+        cues, translator=FakeTranslator(), tts=FakeTts(), voice=VOICE,
+        converter=converter, reference=reference,
+    ))
+
+    assert len(lines) == 2
+    assert len(converter.calls) == 2
+    # Every line carries the converted audio, not the synthesised audio.
+    assert all(np.all(line.pcm == 7) for line in lines)
+    # The reference reached it intact - ten seconds, not an empty clip.
+    assert converter.calls[0][1] == pytest.approx(10.0)
+
+
+def test_the_urdu_text_and_timings_are_untouched_by_conversion():
+    """Conversion changes the voice, not the words or where they land."""
+    from app.controllers.pretranslate import prepare, Cue
+    from app.providers.voice_clone import Reference
+
+    cues = [Cue(4.0, 6.0, "Hello there.")]
+    plain = asyncio.run(prepare(
+        cues, translator=FakeTranslator(), tts=FakeTts(), voice=VOICE))
+    cloned = asyncio.run(prepare(
+        cues, translator=FakeTranslator(), tts=FakeTts(), voice=VOICE,
+        converter=FakeConverter(),
+        reference=Reference(np.zeros(24_000, dtype=np.int16), 24_000),
+    ))
+
+    assert cloned[0].urdu == plain[0].urdu
+    assert cloned[0].start == plain[0].start
+    assert cloned[0].pcm.size == plain[0].pcm.size
+
+
+def test_nothing_is_converted_when_no_reference_was_given():
+    """The feature is opt-in twice over: a converter AND a voice to imitate."""
+    from app.controllers.pretranslate import prepare, Cue
+
+    converter = FakeConverter()
+    lines = asyncio.run(prepare(
+        [Cue(0.0, 2.0, "Hello there.")], translator=FakeTranslator(),
+        tts=FakeTts(), voice=VOICE, converter=converter, reference=None,
+    ))
+    assert converter.calls == []
+    assert not np.all(lines[0].pcm == 7)
+
+
+def test_a_converter_that_fails_says_which_line():
+    from app.controllers.pretranslate import prepare, PrepareError, Cue
+    from app.providers.voice_clone import Reference
+
+    with pytest.raises(PrepareError) as caught:
+        asyncio.run(prepare(
+            [Cue(0.0, 2.0, "Hello there.")], translator=FakeTranslator(),
+            tts=FakeTts(), voice=VOICE, converter=FakeConverter(fail=True),
+            reference=Reference(np.zeros(24_000, dtype=np.int16), 24_000),
+        ))
+    assert "line 1" in str(caught.value)

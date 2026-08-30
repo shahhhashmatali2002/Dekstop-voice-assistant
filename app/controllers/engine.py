@@ -33,6 +33,8 @@ from app.audio import convert
 from app.audio.formats import RATE_ASR, RATE_S2ST
 from app.controllers.drift import DriftController
 from app.controllers.incoming import IncomingPipeline
+from app.providers.factory import build_voice_clone
+from app.audio.routing import DefaultOutputRouter, RoutingUnavailable
 from app.controllers.outgoing import BargeInHandler, OutgoingPipeline
 from app.controllers.vad import VoiceActivityGate
 from app.providers.base import VoiceId
@@ -90,6 +92,13 @@ class Engine:
         #: already been explained.
         self._translating_since: float | None = None
         self._said_why = False
+
+        #: Moves the machine's default output to the cable while translating,
+        #: so nobody has to open the volume mixer - and puts it back on stop,
+        #: on shutdown, and from an atexit hook if we die badly. A default left
+        #: pointing at a cable is indistinguishable from broken sound hardware.
+        self.router = DefaultOutputRouter()
+        self._routing = None
         self._outgoing: OutgoingPipeline | None = None
         self._bargein: BargeInHandler | None = None
         self._pump_task: asyncio.Task | None = None
@@ -140,6 +149,8 @@ class Engine:
             self._thread = None
         self._loop = None
 
+        with contextlib.suppress(Exception):
+            self.router.restore()
         with contextlib.suppress(Exception):
             self.ports.wires.stop()
 
@@ -202,7 +213,42 @@ class Engine:
 
     # ------------------------------------------------------------------
 
+    def _route_audio(self) -> None:
+        """Point Windows at the cable, if the user asked us to do the routing.
+
+        Never fatal. Failing to route means the user does it by hand, which is
+        where they were before this existed; refusing to translate over it
+        would be a strictly worse outcome.
+        """
+        if not getattr(self.config.devices, "auto_route", False):
+            return
+        target = self.config.devices.teams_speaker
+        if not target:
+            return
+        try:
+            was = self.router.route(target)
+            self._notice(
+                "info",
+                f"Everything is going to {target!r} while this runs - you do "
+                f"not need to touch the volume mixer. It goes back when you "
+                f"stop.",
+            )
+            if not was:
+                self._notice("warning", "could not read the previous default output")
+        except RoutingUnavailable as exc:
+            self._notice(
+                "warning",
+                f"Could not route the audio automatically ({exc}). Send the "
+                f"app you want translated to {target!r} in Settings > System > "
+                f"Sound > Volume mixer.",
+            )
+
     async def _start_translating(self) -> None:
+        # In a thread, and not awaited. Enumerating endpoints and creating a
+        # COM object takes seconds on some machines, and Start has to feel
+        # immediate - the routing landing a moment later is invisible, whereas
+        # a Start button that hangs is the whole experience.
+        self._routing = asyncio.ensure_future(asyncio.to_thread(self._route_audio))
         p = self.config.pipeline
         voice = VoiceId(
             vendor=self.config.providers.tts,
@@ -210,7 +256,16 @@ class Engine:
             rate=RATE_S2ST,
         )
 
+        converter, learner = build_voice_clone(
+            self.config,
+            on_notice=lambda message: self._notice("warning", message),
+        )
         self._incoming = IncomingPipeline(
+            converter=converter,
+            learner=learner,
+            clone_max_factor=getattr(
+                self.config.providers, "clone_max_factor", 0.35
+            ),
             asr=self.providers["asr"],
             translator=self.providers["translator"],
             tts=self.providers["tts"],
@@ -284,6 +339,7 @@ class Engine:
         self._said_why = False
 
     async def _stop_translating(self) -> None:
+        self.router.restore()
         self.ports.wires.unmute_all()
         for pipe in (self._incoming, self._outgoing):
             if pipe is not None:

@@ -473,6 +473,8 @@ async def prepare_into(
     voice: VoiceId,
     terminology: Terminology | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
+    converter=None,
+    reference=None,
 ) -> None:
     """Fill `script` line by line, so playback can begin on the first one.
 
@@ -485,6 +487,7 @@ async def prepare_into(
         async for line in prepare_lines(
             cues, translator=translator, tts=tts, voice=voice,
             terminology=terminology, on_progress=on_progress,
+            converter=converter, reference=reference,
         ):
             script.add(line)
     except Exception as exc:
@@ -501,8 +504,18 @@ async def prepare_lines(
     voice: VoiceId,
     terminology: Terminology | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
+    converter=None,
+    reference=None,
 ):
-    """Translate and synthesise each cue, yielding lines as they become ready."""
+    """Translate and synthesise each cue, yielding lines as they become ready.
+
+    `converter` and `reference` are the optional voice-cloning path: the Urdu
+    is synthesised by the normal voice and then converted to sound like
+    `reference`, which for a video is a clip of the video's own audio. It
+    belongs here rather than on the live path because conversion costs real
+    compute per line and this is the one mode where that is paid before
+    playback rather than during it.
+    """
     terms = terminology or Terminology()
     context = RollingContext()
     total = len(cues)
@@ -535,11 +548,25 @@ async def prepare_lines(
         except ProviderError as exc:
             raise PrepareError(f"Synthesis failed on line {index}: {exc}") from exc
 
-        if chunks:
-            yield Line(
-                start=cue.start, english=cue.text, urdu=urdu,
-                pcm=np.concatenate(chunks), rate=rate,
-            )
+        if not chunks:
+            continue
+
+        pcm = np.concatenate(chunks)
+        if converter is not None and reference is not None:
+            try:
+                pcm, rate = converter.convert(pcm, rate, reference)
+            except ProviderError as exc:
+                # The stock voice saying it is far better than nothing saying
+                # it. Reported once and then dropped for the rest of the run,
+                # because a per-line warning on a 600-line video is noise.
+                raise PrepareError(
+                    f"Voice conversion failed on line {index}: {exc}"
+                ) from exc
+
+        yield Line(
+            start=cue.start, english=cue.text, urdu=urdu,
+            pcm=pcm, rate=rate,
+        )
 
 
 async def prepare(
@@ -550,6 +577,8 @@ async def prepare(
     voice: VoiceId,
     terminology: Terminology | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
+    converter=None,
+    reference=None,
 ) -> list[Line]:
     """Every line, before anything is played. Used where a wait is fine."""
     lines = [
@@ -557,6 +586,7 @@ async def prepare(
         async for line in prepare_lines(
             cues, translator=translator, tts=tts, voice=voice,
             terminology=terminology, on_progress=on_progress,
+            converter=converter, reference=reference,
         )
     ]
     if not lines:

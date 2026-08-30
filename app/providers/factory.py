@@ -65,3 +65,47 @@ def build_providers(config: Config, *, include_s2st: bool = True) -> dict:
 
         providers["s2st"] = OpenAiSpeechTranslator(get_secret("OPENAI_API_KEY"))
     return providers
+
+
+def build_voice_clone(config, *, on_notice=None):
+    """A converter and a learner, or (None, None) with a reason said out loud.
+
+    Deliberately does NOT benchmark anything here. The obvious design - time a
+    synthetic clip at startup and refuse if it is too slow - fails on its own
+    terms: the converter trims non-speech before it does anything, so a
+    synthetic clip is trimmed to nothing and the measurement crashes instead of
+    returning a number. Real speech is the only valid input, and at startup
+    there is none: the source has not said anything yet.
+
+    So the judgement moves to where the evidence is. The pipeline times its
+    FIRST real conversion and switches the feature off if that one cost more
+    than the budget, which is both honest and only one utterance late.
+    """
+    from app.audio.formats import RATE_ASR
+    from app.providers.base import ProviderError
+    from app.providers.voice_clone import VoiceLearner, build_converter
+
+    p = config.providers
+    if not getattr(p, "clone_voice", False):
+        return None, None
+
+    def say(message: str) -> None:
+        if on_notice:
+            try:
+                on_notice(message)
+            except Exception:
+                pass
+
+    try:
+        backend = getattr(p, "clone_backend", "light")
+        converter = build_converter(backend)
+    except ProviderError as exc:
+        say(f"Speaking in the original voice is off: {exc}")
+        return None, None
+
+    say(
+        "Speaking in the original speaker's voice: learning voice from audio. "
+        "Audio starts in real-time."
+    )
+    return converter, VoiceLearner(RATE_ASR, min_seconds=2.0)
+

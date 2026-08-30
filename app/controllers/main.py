@@ -677,10 +677,17 @@ def _report_startup_failure(message: str, exc: BaseException) -> None:
         pass
 
 
-def main(*, allow_capture: bool = False, mode: str = "") -> int:
+def main(
+    *, allow_capture: bool = False, mode: str = "", clone_voice: bool = False
+) -> int:
     config = Config.load()
     if mode:
         config.mode = mode
+    if clone_voice:
+        # Not saved: it is a per-run choice until it has proved itself on this
+        # machine, and a saved "on" that the engine then declines every start
+        # is a worse experience than typing the flag.
+        config.providers.clone_voice = True
     if allow_capture:
         # One run only. §2.4 is not a preference, and a saved "off" would sit
         # there quietly until the call where it matters.

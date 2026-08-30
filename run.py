@@ -97,6 +97,13 @@ def main() -> int:
                          "understand it - one cable, microphone off. "
                          "'meeting': a two-way Teams call. Asked once and "
                          "remembered if not given.")
+    ap.add_argument("--clone-voice", action="store_true",
+                    help="speak the Urdu in the voice of whoever is speaking "
+                         "on the source. The voice is learned from the audio "
+                         "as it plays, so the first half-minute is in the "
+                         "normal voice. The full clone needs a GPU; without "
+                         "one it measures itself, says so, and drops to a "
+                         "light pitch-and-tone match that any CPU can run.")
     ap.add_argument("--allow-capture", action="store_true",
                     help="let every window appear in screenshots and screen "
                          "shares (they are excluded by default, §2.4)")
@@ -124,7 +131,11 @@ def main() -> int:
 
     from app.controllers.main import main as app_main
 
-    return app_main(allow_capture=args.allow_capture, mode=args.mode or "")
+    return app_main(
+        allow_capture=args.allow_capture,
+        mode=args.mode or "",
+        clone_voice=args.clone_voice,
+    )
 
 
 if __name__ == "__main__":

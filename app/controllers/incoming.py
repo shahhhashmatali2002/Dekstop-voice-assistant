@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -75,6 +75,9 @@ class IncomingPipeline:
         on_transcript=None,
         on_degrade=None,
         preroll_ms: float = 250.0,
+        converter=None,
+        learner=None,
+        clone_max_factor: float = 0.35,
     ) -> None:
         self.asr = asr
         self.translator = translator
@@ -91,6 +94,17 @@ class IncomingPipeline:
         self.on_degrade = on_degrade
 
         self.preroll_ms = max(0.0, preroll_ms)
+
+        # Speaking in the source speaker's own voice. Both are optional and
+        # both must be present for anything to happen: a converter with no
+        # voice to imitate has nothing to do, and a learned voice with no
+        # converter is just a recording nobody asked for.
+        self.converter = converter
+        self.learner = learner
+        self.clone_max_factor = clone_max_factor
+        self._clone_failed = False
+        self._clone_ready = False
+        self._clone_probe: asyncio.Task | None = None
 
         self.context = RollingContext()
         self._audio_in: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=100)
@@ -212,6 +226,10 @@ class IncomingPipeline:
 
                 if res.speech:
                     self.speech_ms += 1000.0 * frame.size / RATE_ASR
+                    if self.learner is not None and not self._clone_failed:
+                        # Only speech: a reference built from room tone
+                        # converts every line into room tone.
+                        self.learner.hear(frame)
 
                 if res.event is SpeechEvent.ONSET:
                     # Deliberately NOT segmenter.reset(). The gate reports an
@@ -405,6 +423,186 @@ class IncomingPipeline:
         )
         await self._speak(spoken, trace, decision.rate)
 
+    def _clone_reference(self):
+        """The voice to imitate, or None - which is the normal case.
+
+        None means one of: the feature is off, the machine was too slow for it,
+        conversion has already failed once this session, or not enough of the
+        speaker has been heard yet. All four end the same way - the stock voice
+        speaks - so they are one check rather than four.
+        """
+        if self.converter is None or self.learner is None or self._clone_failed:
+            return None
+        reference = self.learner.reference()
+        if reference is None:
+            return None
+        if not self._clone_ready:
+            if self._clone_probe is None or self._clone_probe.done():
+                self._clone_probe = asyncio.ensure_future(self._probe(reference))
+            return None
+        return reference
+
+    async def _clone(self, pcm: np.ndarray, rate: int, reference):
+        """Convert one utterance to the speaker's voice, off the event loop.
+
+        In a thread, and this is not a detail: conversion is seconds of solid
+        CPU, and doing it inline would stop the audio pump feeding the
+        recogniser - which closes the socket after about ten seconds of
+        silence and takes the whole session down with it. That failure has
+        already happened once in this project, from a different cause, and it
+        looks like translation dying mid-video for no reason.
+
+        A failure switches cloning off for the session rather than dropping the
+        line. The stock voice saying it is worth far more than nothing saying
+        it.
+        """
+        try:
+            return await asyncio.to_thread(
+                self.converter.convert, pcm, rate, reference
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._clone_failed = True
+            if self.on_degrade:
+                with contextlib.suppress(Exception):
+                    self.on_degrade(
+                        "impair",
+                        f"speaking in the original voice is off: {exc}",
+                    )
+            return pcm, rate
+
+    #: How much of the learned voice to convert as a trial. Long enough to be
+    #: representative, short enough that a slow machine finds out quickly.
+    CLONE_PROBE_S = 0.5
+
+
+    async def _probe(self, reference) -> None:
+        """Find out what conversion costs here, without a listener paying for it.
+
+        The measurement has to happen on real speech - the converter trims
+        non-speech before matching, so a synthetic clip is trimmed to nothing -
+        and it must not happen on a line somebody is waiting to hear. The
+        learned voice is both: real speech, and already ours.
+
+        This is the second design. The first timed the first real utterance,
+        which worked but cost the user that utterance and, on a machine four
+        times too slow, a queue deep enough that the drift controller dropped
+        the sentences behind it. A trial off to one side costs nobody anything.
+
+        Two conversions, and only the second is timed: the first pays for
+        loading the model, which is a one-off of tens of seconds and would
+        otherwise be charged to a per-second figure and make every machine look
+        hopeless.
+        """
+        self._match_voice_to_speaker(reference)
+
+        pcm = reference.pcm[: int(self.CLONE_PROBE_S * reference.rate)]
+        seconds = max(pcm.size / float(reference.rate or 1), 1e-6)
+
+        factor, failure = await self._time_conversion(pcm, reference, seconds)
+        if factor is not None and factor <= self.clone_max_factor:
+
+
+            self._clone_ready = True
+            self._say(
+                f"now speaking in the original speaker's voice "
+                f"({factor:.2f}s of conversion per second of audio)"
+            )
+            return
+
+        # Too slow, or not installed. Rather than give up on the idea, drop to
+        # the cheap version - pitch and tone matched to the speaker, which is a
+        # resemblance rather than their voice, and which any machine can run.
+        # Saying "no" to somebody who asked for this and can nearly have it is
+        # a worse answer than saying "here is the part that fits".
+        why = (
+            f"the full voice clone needs {factor:.1f}s of compute per second "
+            f"of audio here, which would add about {factor * 4:.0f}s to every "
+            f"sentence"
+            if factor is not None
+            else f"the full voice clone is unavailable ({failure})"
+        )
+        if getattr(self.converter, "name", "") == "light-match":
+            self._clone_failed = True
+            self._say(f"speaking in the original voice is off: {failure or why}")
+            return
+
+        from app.providers.voice_clone import LightVoiceMatcher
+
+        self.converter = LightVoiceMatcher()
+        light, light_failure = await self._time_conversion(pcm, reference, seconds)
+        if light_failure:
+            self._clone_failed = True
+            self._say(f"speaking in the original voice is off: {why}")
+            return
+
+
+
+
+        self._clone_ready = True
+        self._say(
+            f"{why}. Using the light voice match instead: the speaker's pitch "
+            f"and tone on our voice, which is a resemblance rather than their "
+            f"actual voice. For the real thing on this machine, use "
+            f"pretranslate.py --clone-voice, which prepares everything before "
+            f"playback."
+        )
+
+    async def _time_conversion(self, pcm, reference, seconds):
+        """(factor, failure). Two conversions; only the second is timed.
+
+        The first pays for loading the model - tens of seconds, once - and
+        charging that to a per-second figure would make every machine look
+        hopeless.
+        """
+        try:
+            await asyncio.to_thread(
+                self.converter.convert, pcm, reference.rate, reference
+            )
+            started = now()
+            await asyncio.to_thread(
+                self.converter.convert, pcm, reference.rate, reference
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return None, str(exc)
+        return (now() - started) / seconds, ""
+
+    def _match_voice_to_speaker(self, reference) -> None:
+        """Read the speaker's pitch and pick the Urdu voice nearest to it.
+
+        Worth more than the conversion that follows it. Pitch-shifting a female
+        voice down an octave to stand in for a man produces a distorted woman,
+        not a man; reading the line with the male voice starts an octave closer
+        with no artefacts at all.
+        """
+        from app.providers.voice_clone import voice_for_pitch
+
+        estimate = getattr(self.converter, "median_f0", None)
+        if estimate is None:
+            from app.providers.voice_clone import LightVoiceMatcher
+
+            estimate = LightVoiceMatcher().median_f0
+        try:
+            f0 = estimate(reference.pcm, reference.rate)
+            wanted = voice_for_pitch(f0)
+        except Exception:
+            return
+        if not wanted or wanted == self.voice.name:
+            return
+        self.voice = replace(self.voice, name=wanted)
+        self._say(
+            f"the speaker sounds like a {'man' if f0 < 160 else 'woman'} "
+            f"({f0:.0f} Hz) - switching to {wanted}"
+        )
+
+    def _say(self, message: str) -> None:
+        if self.on_degrade:
+            with contextlib.suppress(Exception):
+                self.on_degrade("impair", message)
+
     async def _speak(self, text: str, trace: UnitTrace, rate: float) -> None:
         """Synthesise one unit and hand it to the player.
 
@@ -469,22 +667,42 @@ class IncomingPipeline:
             held = []
             held_ms = 0.0
 
+        def shape(pcm: np.ndarray, chunk_rate: int) -> np.ndarray:
+            """Everything between the voice and the sink."""
+            if rate > 1.001:
+                pcm = time_stretch(pcm, rate, chunk_rate)
+            if chunk_rate != self.sink.rate:
+                pcm = convert.resample(pcm, chunk_rate, self.sink.rate)
+            if getattr(self.sink, "channels", 1) > 1:
+                pcm = convert.to_channels(pcm, self.sink.channels)
+            if self._ducked:
+                pcm = convert.apply_gain_db(pcm, -20.0)
+            return pcm
+
+        # Speaking in the source speaker's voice, if enough of it has been
+        # heard yet. Conversion needs the WHOLE utterance - it matches frames
+        # against the speaker's audio, and a fragment cut mid-word converts
+        # into a fragment cut mid-word - so streaming is given up for this
+        # utterance. That costs the streaming head start, which is why the
+        # engine refuses to enable this at all unless conversion measured fast
+        # enough on this machine to afford it.
+        reference = self._clone_reference()
+        raw: list[np.ndarray] = []
+        raw_rate = 0
+
         try:
             async for chunk in self.tts.synthesize(text, self.voice):
                 if chunk.pcm.size == 0:
                     continue
                 if not trace.t_tts_first_chunk:
                     trace.mark("tts_first_chunk")
-                pcm = chunk.pcm
-                if rate > 1.001:
-                    pcm = time_stretch(pcm, rate, chunk.rate)
-                if chunk.rate != self.sink.rate:
-                    pcm = convert.resample(pcm, chunk.rate, self.sink.rate)
-                if getattr(self.sink, "channels", 1) > 1:
-                    pcm = convert.to_channels(pcm, self.sink.channels)
-                if self._ducked:
-                    pcm = convert.apply_gain_db(pcm, -20.0)
 
+                if reference is not None:
+                    raw.append(chunk.pcm)
+                    raw_rate = chunk.rate
+                    continue
+
+                pcm = shape(chunk.pcm, chunk.rate)
                 held.append(pcm)
                 held_ms += pcm.size / samples_per_ms
                 # The cushion applies to the start of the utterance. After
@@ -492,6 +710,15 @@ class IncomingPipeline:
                 # one that paces them.
                 if held_ms >= (self.preroll_ms if started is None else 0.0):
                     await release()
+
+            if reference is not None and raw:
+                whole = np.concatenate(raw) if len(raw) > 1 else raw[0]
+                converted, converted_rate = await self._clone(
+                    whole, raw_rate, reference
+                )
+                pcm = shape(converted, converted_rate)
+                held.append(pcm)
+                held_ms += pcm.size / samples_per_ms
 
             # An utterance shorter than the cushion never reaches the
             # threshold. It still has to be spoken - "kya?" is a whole turn.

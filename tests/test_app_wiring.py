@@ -553,3 +553,95 @@ def test_a_looping_configuration_never_opens_a_stream(monkeypatch):
         "a looping configuration must be refused before any stream opens"
     )
     app._cleanup()
+
+
+# ----------------------------------------------------------------------
+# routing, done by the application instead of by hand
+# ----------------------------------------------------------------------
+
+
+def test_the_engine_routes_on_start_and_restores_on_stop():
+    """The user's ask: do not make me change Windows settings by hand, and put
+    them back when you close."""
+    from app.controllers.engine import Engine
+
+    moved: list[str] = []
+
+    class FakeRouter:
+        routed = False
+
+        def route(self, name):
+            moved.append(f"route:{name}")
+            self.routed = True
+            return "speakers-id"
+
+        def restore(self):
+            if self.routed:
+                moved.append("restore")
+                self.routed = False
+
+    engine = Engine.__new__(Engine)          # no audio devices required
+    engine.router = FakeRouter()
+    engine.config = _config_with_route("CABLE Input", auto=True)
+    engine._notice = lambda *a, **k: None
+
+    engine._route_audio()
+    engine.router.restore()
+    assert moved == ["route:CABLE Input", "restore"]
+
+
+def test_nothing_is_touched_when_the_user_turned_routing_off():
+    from app.controllers.engine import Engine
+
+    moved: list[str] = []
+
+    class FakeRouter:
+        def route(self, name):
+            moved.append(name)
+            return ""
+
+        def restore(self):
+            pass
+
+    engine = Engine.__new__(Engine)
+    engine.router = FakeRouter()
+    engine.config = _config_with_route("CABLE Input", auto=False)
+    engine._notice = lambda *a, **k: None
+
+    engine._route_audio()
+    assert moved == []
+
+
+def test_a_routing_failure_is_a_notice_not_a_refusal_to_translate():
+    """Failing to route leaves the user exactly where they were before this
+    feature existed - doing it by hand. Refusing to translate over it would be
+    strictly worse."""
+    from app.controllers.engine import Engine
+    from app.audio.routing import RoutingUnavailable
+
+    said: list[str] = []
+
+    class BrokenRouter:
+        def route(self, name):
+            raise RoutingUnavailable("no such device")
+
+        def restore(self):
+            pass
+
+    engine = Engine.__new__(Engine)
+    engine.router = BrokenRouter()
+    engine.config = _config_with_route("CABLE Input", auto=True)
+    engine._notice = lambda severity, message, *a: said.append((severity, message))
+
+    engine._route_audio()   # must not raise
+    assert said and said[0][0] == "warning"
+    assert "Volume mixer" in said[0][1], "the manual fallback was not explained"
+
+
+def _config_with_route(device: str, *, auto: bool):
+    from app.models.config import Config
+
+    config = Config()
+    config.devices.teams_speaker = device
+    config.devices.auto_route = auto
+    return config

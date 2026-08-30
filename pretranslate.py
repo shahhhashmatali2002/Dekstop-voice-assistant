@@ -121,6 +121,63 @@ def read_transcript(source: str, languages, *, transcribe_audio: bool):
         return merge_sentences(transcribe(audio, get_secret("DEEPGRAM_API_KEY")))
 
 
+def build_clone(source: str, *, seconds: float = 0.0, backend: str = "knn"):
+    """A converter, measured on this machine, and the voice to imitate.
+
+    The reference is either a recording the user pointed at or a clip of the
+    video's own audio - which is the interesting case, because it means the
+    voice you hear the Urdu in is the voice that was actually speaking.
+
+    The measurement is printed rather than hidden. On a CPU this is several
+    times slower than real time, and a user who is about to wait twenty minutes
+    for a forty-minute video deserves to be told before the wait, not during
+    it.
+    """
+    from pathlib import Path
+    import tempfile
+
+    from app.controllers.pretranslate import PrepareError, download_audio
+    from app.providers.voice_clone import build_converter, pick_reference
+
+    converter = build_converter(backend)
+    # The backend decides how much reference it wants: kNN-VC matches frames
+    # against the target's own audio, so minutes help it, while Seed-VC needs
+    # only a few seconds. For a video neither costs anything - the audio is
+    # already downloaded.
+    want = seconds or converter.preferred_reference_s
+
+    from app.audio.decode import DecodeUnavailable, read_audio_file
+
+    def decode(path: Path):
+        # A downloaded YouTube audio track is usually Opus in WebM, which
+        # miniaudio cannot read - read_audio_file falls back to ffmpeg.
+        try:
+            return read_audio_file(path)
+        except DecodeUnavailable as exc:
+            raise PrepareError(str(exc)) from exc
+
+    local = Path(source)
+    if local.exists():
+        pcm, rate = decode(local)
+    else:
+        print(f"\n  Taking the reference voice from {source}")
+        with tempfile.TemporaryDirectory(prefix="clone-ref-") as scratch:
+            pcm, rate = decode(download_audio(source, Path(scratch)))
+
+    reference = pick_reference(pcm, rate, seconds=max(1.0, min(300.0, want)))
+    if reference.pcm.size == 0:
+        raise PrepareError("Could not find any audio to use as a reference.")
+
+    print(f"  reference clip: {reference.seconds:.0f}s   "
+          f"backend: {converter.name}   device: {converter.device}")
+    factor = converter.measure(reference, seconds=2.0)
+    print(f"  voice conversion runs at {factor:.2f}x compute per second of audio")
+    if factor >= 1.0:
+        print("  slower than real time, so everything is prepared before the "
+              "video starts.")
+    return converter, reference
+
+
 def open_audio(cfg: Config, *, follow: bool):
     """The output sink, and the source we watch to follow the video."""
     from app.audio.devices import AudioUnavailable, DeviceManager
@@ -149,7 +206,8 @@ def open_audio(cfg: Config, *, follow: bool):
     return dm, sink, source, device
 
 
-async def play(cfg: Config, cues, sink, source, *, start_at: float, offset: float):
+async def play(cfg: Config, cues, sink, source, *, start_at: float, offset: float,
+               converter=None, reference=None):
     """Prepare and play at the same time, following the video if we can."""
     from app.audio.formats import RATE_S2ST
     from app.controllers.pretranslate import (
@@ -175,11 +233,21 @@ async def play(cfg: Config, cues, sink, source, *, start_at: float, offset: floa
     preparing = asyncio.ensure_future(prepare_into(
         script, cues, translator=providers["translator"], tts=providers["tts"],
         voice=voice, on_progress=progress,
+        converter=converter, reference=reference,
     ))
 
-    # A couple of lines in hand before the video starts, so the first sentence
-    # is never the one we are still synthesising.
-    while script.ready < 2 and not script.finished:
+    # How many lines to have in hand before the video starts. Normally two -
+    # enough that the first sentence is never the one still being synthesised.
+    # With voice conversion slower than real time, preparation can never catch
+    # up with playback, so the whole thing is prepared first: a wait before the
+    # video, instead of the Urdu falling further behind for forty minutes.
+    factor = getattr(converter, "realtime_factor", 0.0) or 0.0
+    head_start = len(cues) if factor >= 1.0 else 2
+    if head_start > 2:
+        print(f"  preparing all {len(cues)} lines before starting"
+              f" - about {len(cues) * factor / 60:.0f} min of conversion")
+
+    while script.ready < head_start and not script.finished:
         await asyncio.sleep(0.1)
     if script.error:
         raise script.error
@@ -246,6 +314,25 @@ def main() -> int:
                          "costs credit, but works on videos with captions "
                          "disabled and on ones YouTube will not serve to a "
                          "plain HTTP client.")
+    ap.add_argument("--clone-voice", action="store_true",
+                    help="speak the Urdu in the voice of the video's own "
+                         "speaker, by converting the synthesised audio onto a "
+                         "reference clip taken from the video. Needs torch "
+                         "installed, and is several times slower than real "
+                         "time on a CPU - run tools/clone_bench.py first.")
+    ap.add_argument("--clone-ref", metavar="FILE",
+                    help="use this recording as the voice to imitate instead "
+                         "of a clip of the video")
+    ap.add_argument("--clone-seconds", type=float, default=0.0, metavar="N",
+                    help="how much reference audio to use; the default is what "
+                         "the backend wants - about two and a half minutes for "
+                         "knn-vc, ten seconds for seed-vc")
+    ap.add_argument("--clone-backend", default="knn",
+                    choices=("knn", "light", "seed"),
+                    help="knn (default) is the real thing and needs torch; "
+                         "light is a pitch-and-tone resemblance that runs on "
+                         "any CPU in real time; seed pins numpy below 2.0 and "
+                         "will not install on Python 3.13 without a compiler")
     args = ap.parse_args()
 
     cfg = Config.load()
@@ -269,6 +356,19 @@ def main() -> int:
     span = cues[-1].end if cues else 0.0
     print(f"  {len(cues)} sentences over {format_position(span)}")
 
+    converter = reference = None
+    if args.clone_voice:
+        from app.providers.base import ProviderError
+        try:
+            converter, reference = build_clone(
+                args.clone_ref or args.url,
+                seconds=args.clone_seconds,
+                backend=args.clone_backend,
+            )
+        except (PrepareError, ProviderError) as exc:
+            print(f"\n  {exc}\n")
+            return 2
+
     from app.audio.devices import AudioUnavailable
 
     try:
@@ -282,6 +382,7 @@ def main() -> int:
         player = asyncio.run(play(
             cfg, cues, sink, source,
             start_at=args.start, offset=args.offset,
+            converter=converter, reference=reference,
         ))
         print(f"\n  Done. {player.spoken} lines spoken"
               + (f", {player.skipped} skipped as already past." if player.skipped

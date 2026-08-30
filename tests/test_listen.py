@@ -1719,3 +1719,258 @@ def test_nothing_is_said_while_words_are_being_recognised(engine_fixture):
     assert not [n for n in notices if "arriving" in n["message"]], (
         f"complained while it was working: {notices}"
     )
+
+
+# ----------------------------------------------------------------------
+# speaking in the source speaker's voice, live
+# ----------------------------------------------------------------------
+
+
+def test_the_voice_is_learned_from_speech_only(engine_fixture):
+    """A reference built from room tone converts every line into room tone,
+    so only frames the gate called speech are kept."""
+    from app.providers.voice_clone import VoiceLearner
+
+    engine, ports, providers, *_ = engine_fixture(["hello"])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    pipe = engine._pipe
+    pipe.learner = VoiceLearner(16_000, min_seconds=0.5)
+
+    ports.source.ring.write(np.zeros(48_000, dtype=np.int16))   # silence
+    time.sleep(0.3)
+    assert pipe.learner.seconds == 0.0, "silence was kept as a reference"
+
+    ports.source.ring.write(loud(600))
+    assert wait_for(lambda: pipe.learner.seconds > 0.2, timeout=3.0), (
+        "speech never reached the learner"
+    )
+
+
+def test_the_stock_voice_speaks_while_the_voice_is_still_being_learned(
+    engine_fixture,
+):
+    """Half a minute of the stock voice beats half a minute of silence, and
+    beats converting against two seconds of audio."""
+    from app.providers.voice_clone import VoiceLearner
+
+    engine, ports, providers, *_ = engine_fixture(["The deployment failed."])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    pipe = engine._pipe
+    converted = []
+
+    class NeverReady:
+        def convert(self, pcm, rate, reference):
+            converted.append(pcm.size)
+            return pcm, rate
+
+    pipe.converter = NeverReady()
+    pipe.learner = VoiceLearner(16_000, min_seconds=600.0)   # never ready
+
+    ports.source.ring.write(loud(400))
+    assert wait_for(lambda: ports.output.played_samples > 0, timeout=5.0), (
+        "nothing was spoken while the voice was still being learned"
+    )
+    assert converted == [], "converted before it had heard enough"
+
+
+def test_a_broken_converter_falls_back_rather_than_giving_up(
+    engine_fixture,
+):
+    """Never silence, and never a dead end: a converter that will not run is
+    replaced by the cheap one, and the line is spoken either way."""
+    from app.providers.voice_clone import VoiceLearner
+
+    engine, ports, providers, *_ = engine_fixture(["The deployment failed."])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    pipe = engine._pipe
+
+    class Broken:
+        name = "broken"
+        calls = 0
+
+
+        def convert(self, pcm, rate, reference):
+            Broken.calls += 1
+            raise RuntimeError("no model")
+
+    learner = VoiceLearner(16_000, min_seconds=0.01)
+    learner.hear(np.ones(16_000, dtype=np.int16))
+    pipe.converter = Broken()
+    pipe.learner = learner
+
+    ports.source.ring.write(loud(400))
+    assert wait_for(lambda: ports.output.played_samples > 0, timeout=5.0), (
+        "a broken converter silenced the translation"
+    )
+    assert wait_for(lambda: pipe.converter.name == "light-match", timeout=6.0), (
+        "a broken converter was kept"
+    )
+    assert Broken.calls == 1, f"retried a broken converter {Broken.calls} times"
+
+
+def test_the_converted_audio_is_what_reaches_the_speakers(engine_fixture):
+    """The whole point: what is played is the converted voice, not the audio
+    the stock voice produced."""
+    from app.providers.voice_clone import VoiceLearner
+
+    engine, ports, providers, *_ = engine_fixture(["The deployment failed."])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    pipe = engine._pipe
+
+    class Marking:
+        seen = 0
+
+        def convert(self, pcm, rate, reference):
+            Marking.seen += 1
+            return np.full(pcm.size, 4321, dtype=np.int16), rate
+
+    learner = VoiceLearner(16_000, min_seconds=0.01)
+    learner.hear(np.ones(16_000, dtype=np.int16))
+    pipe.converter = Marking()
+    pipe.learner = learner
+    # The trial conversion has its own tests; this one is about what reaches
+    # the speakers once the voice has been adopted.
+    pipe._clone_ready = True
+
+    ports.source.ring.write(loud(400))
+    assert wait_for(lambda: ports.output.written, timeout=5.0)
+    assert Marking.seen >= 1
+    played = np.concatenate(ports.output.written)
+    assert np.any(played == 4321), "the stock voice was played, not the clone"
+
+
+def test_a_converter_too_slow_for_this_machine_falls_back_to_the_light_match(
+    engine_fixture,
+):
+    """The cost is measured on a trial conversion of the learned voice, not on
+    a line somebody is waiting to hear.
+
+    The previous version timed the first real utterance. It worked, and on a
+    machine four times too slow it also cost that utterance and left a queue
+    deep enough that the drift controller dropped the several sentences behind
+    it - which is what the user saw as a run of "dropped" lines."""
+    from app.providers.voice_clone import VoiceLearner
+
+    engine, ports, providers, *_ = engine_fixture(["The deployment failed."])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    pipe = engine._pipe
+
+    class Slow:
+        name = "slow"
+        calls = 0
+
+
+        def convert(self, pcm, rate, reference):
+            Slow.calls += 1
+            time.sleep(0.4)          # against 300 ms of fake TTS audio
+            return pcm, rate
+
+    learner = VoiceLearner(16_000, min_seconds=0.01)
+    learner.hear(np.ones(16_000, dtype=np.int16))
+    pipe.converter = Slow()
+    pipe.learner = learner
+    pipe.clone_max_factor = 0.35
+
+    ports.source.ring.write(loud(400))
+    assert wait_for(lambda: pipe._clone_ready, timeout=8.0), (
+        "the slow converter was neither adopted nor replaced"
+    )
+    assert pipe.converter.name == "light-match", (
+        f"fell back to {pipe.converter.name!r} rather than the light match"
+    )
+    assert pipe._clone_failed is False, "gave up instead of falling back"
+    assert wait_for(lambda: ports.output.played_samples > 0, timeout=5.0)
+    # At most the two trial conversions - one to load the model, one timed -
+    # and never a real line.
+    assert Slow.calls <= 2, f"{Slow.calls} conversions; a real line was charged"
+
+
+def test_a_converter_inside_the_budget_is_kept(engine_fixture):
+    from app.providers.voice_clone import VoiceLearner
+
+    engine, ports, providers, *_ = engine_fixture(["The deployment failed."])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    pipe = engine._pipe
+
+    class Quick:
+        def convert(self, pcm, rate, reference):
+            return pcm, rate
+
+    learner = VoiceLearner(16_000, min_seconds=0.01)
+    learner.hear(np.ones(16_000, dtype=np.int16))
+    pipe.converter = Quick()
+    pipe.learner = learner
+    pipe.clone_max_factor = 0.35
+
+    ports.source.ring.write(loud(400))
+    assert wait_for(lambda: pipe._clone_ready, timeout=5.0), (
+        "a converter well inside the budget was not adopted"
+    )
+    assert wait_for(lambda: ports.output.played_samples > 0, timeout=5.0)
+    assert pipe._clone_failed is False
+
+
+def test_the_trial_conversion_runs_once_not_on_every_line(engine_fixture):
+    """It is scheduled from the same place that asks for a reference, which is
+    every utterance - so without a guard it would start a fresh trial each
+    time and never finish deciding."""
+    from app.providers.voice_clone import VoiceLearner
+
+    engine, ports, providers, *_ = engine_fixture(["hello", "hello there"])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    pipe = engine._pipe
+
+    class Counting:
+        calls = 0
+
+        def convert(self, pcm, rate, reference):
+            Counting.calls += 1
+            return pcm, rate
+
+    learner = VoiceLearner(16_000, min_seconds=0.01)
+    learner.hear(np.ones(16_000, dtype=np.int16))
+    pipe.converter = Counting()
+    pipe.learner = learner
+
+    ports.source.ring.write(loud(600))
+    assert wait_for(lambda: pipe._clone_ready, timeout=5.0)
+    time.sleep(0.3)
+    # Two for the trial (one to load the model, one timed), then real lines.
+    assert Counting.calls >= 2
+    first_run = Counting.calls
+    ports.source.ring.write(loud(200))
+    time.sleep(0.3)
+    assert Counting.calls - first_run <= 2, "the trial ran again"
+
+
+def test_the_light_match_failing_is_the_end_of_the_road(engine_fixture):
+    """There is nothing cheaper to fall back to, so it stops rather than
+    looping through backends forever."""
+    from app.providers.voice_clone import LightVoiceMatcher, VoiceLearner
+
+    engine, ports, providers, *_ = engine_fixture(["The deployment failed."])
+    engine.start()
+    engine.start_listening().result(timeout=5)
+    pipe = engine._pipe
+
+    class BrokenLight(LightVoiceMatcher):
+        def convert(self, pcm, rate, reference):
+            raise RuntimeError("nope")
+
+    learner = VoiceLearner(16_000, min_seconds=0.01)
+    learner.hear(np.ones(16_000, dtype=np.int16))
+    pipe.converter = BrokenLight()
+    pipe.learner = learner
+
+    ports.source.ring.write(loud(400))
+    assert wait_for(lambda: pipe._clone_failed, timeout=6.0), (
+        "a broken light match was not given up on"
+    )
+    assert wait_for(lambda: ports.output.played_samples > 0, timeout=5.0)

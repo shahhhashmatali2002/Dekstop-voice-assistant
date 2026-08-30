@@ -74,6 +74,7 @@ from app.audio.passthrough import PassthroughWire
 from app.audio.streams import CaptureSource, RenderSink
 from app.controllers.drift import DriftController
 from app.controllers.incoming import IncomingPipeline
+from app.providers.factory import build_voice_clone
 from app.controllers.segmenter import Segmenter
 from app.controllers.vad import VoiceActivityGate
 from app.models.config import Config
@@ -528,7 +529,16 @@ class ListenEngine:
             name=self.config.providers.urdu_voice,
             rate=RATE_S2ST,
         )
+        converter, learner = build_voice_clone(
+            self.config,
+            on_notice=lambda message: self._notice("warning", message),
+        )
         return IncomingPipeline(
+            converter=converter,
+            learner=learner,
+            clone_max_factor=getattr(
+                self.config.providers, "clone_max_factor", 0.35
+            ),
             asr=self.providers["asr"],
             translator=self.providers["translator"],
             tts=self.providers["tts"],
