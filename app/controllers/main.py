@@ -127,14 +127,16 @@ class Application:
         # and save it, so a first run reaches the bubble instead of a form
         # (§11.7). Only blanks are filled; a choice already made stands.
         video = self.config.mode == "video"
-        chosen, blocking = autoconfigure(self.config, dm)
-        for choice in chosen:
-            self._on_notice({"severity": "info", "message": f"Auto: {choice}"})
-        if blocking:
-            # Report the missing thing, not its three consequences. Without a
-            # second cable every role falls back to the same speaker and the
-            # feedback checks fire three times, describing symptoms.
-            return None, blocking
+        if self.config.mode or self.config.setup_complete:
+            chosen, blocking = autoconfigure(self.config, dm)
+            for choice in chosen:
+                self._on_notice({"severity": "info", "message": f"Auto: {choice}"})
+            if blocking:
+                # Report the missing thing, not its three consequences. Without a
+                # second cable every role falls back to the same speaker and the
+                # feedback checks fire three times, describing symptoms.
+                return None, blocking
+
 
         def resolve(name: str, role: str, capture: bool, fallback=None):
             """Resolve one endpoint, falling back to the Windows default.
@@ -210,9 +212,17 @@ class Application:
         mic = None if video else CaptureSource(dm, mic_dev)
         vmic = None if video else RenderSink(dm, vmic_dev)
 
-        self._streams = [s for s in (mic, phones, vmic, teams) if s is not None]
+        self._streams = [s for s in (teams, vmic, phones, mic) if s is not None]
+
+
         for s in self._streams:
-            s.start()
+            try:
+                s.start()
+            except Exception as exc:
+                dev_name = getattr(getattr(s, "device", None), "name", "audio device")
+                problems.append(f"Could not open audio device {dev_name!r}: {exc}")
+                return None, problems
+
 
         wires = PassthroughPair(
             outgoing=None if video else PassthroughWire(mic, vmic, name="mic->vmic"),
@@ -475,7 +485,7 @@ class Application:
         """
         self._install_signal_handlers()
         capture_guard.set_enabled(self.config.ui.exclude_from_capture)
-        if not self.config.mode and not self._ask_mode():
+        if not getattr(self.config, "_cli_mode_given", False) and not self._ask_mode():
             return 0  # the question was closed rather than answered
 
         ports, problems = self.build_audio()
@@ -492,13 +502,10 @@ class Application:
         return self.qt.exec()
 
     def _ask_mode(self) -> bool:
-        """Ask what is being translated, once, and remember the answer.
+        """Ask what is being translated, and remember the answer.
 
-        The two topologies are genuinely different and neither can be
-        inferred: one cable and no microphone for something that is playing,
-        two cables and a live microphone for a conversation. Guessing wrong
-        is not a cosmetic error - it opens a microphone nobody asked for, or
-        it fails to open the one the call needs.
+        The two topologies are genuinely different: one cable and no microphone for something that is playing,
+        two cables and a live microphone for a conversation.
         """
         from PySide6.QtWidgets import QMessageBox
 
@@ -508,8 +515,8 @@ class Application:
         box.setInformativeText(
             "A video, a podcast, anything playing on this computer\n"
             "    English in, Urdu out. One cable, microphone stays off.\n\n"
-            "A Teams call\n"
-            "    Both directions. Needs a second cable and your microphone."
+            "A Teams / Zoom call\n"
+            "    Both directions. Needs virtual cables and your microphone."
         )
         video = box.addButton("Something playing", QMessageBox.AcceptRole)
         meeting = box.addButton("A Teams call", QMessageBox.AcceptRole)
@@ -521,13 +528,27 @@ class Application:
         clicked = box.clickedButton()
         if clicked is video:
             self.config.mode = "video"
+            self.config.devices.teams_speaker = ""
+            self.config.devices.virtual_mic = ""
         elif clicked is meeting:
             self.config.mode = "meeting"
+            self.config.devices.teams_speaker = ""
+            self.config.devices.virtual_mic = ""
         else:
             return False
+
+        try:
+            if self._dm is None:
+                self._dm = DeviceManager()
+            autoconfigure(self.config, self._dm, save=True, mode=self.config.mode)
+        except Exception:
+            pass
+
         self.config.save()
-        print(f"  Mode: {self.config.mode} (change it with --mode)")
+        print(f"  Mode set to: {self.config.mode}")
         return True
+
+
 
     def _install_signal_handlers(self) -> None:
         """Make Ctrl+C in the console actually quit.
@@ -678,16 +699,19 @@ def _report_startup_failure(message: str, exc: BaseException) -> None:
 
 
 def main(
-    *, allow_capture: bool = False, mode: str = "", clone_voice: bool = False
+    *, allow_capture: bool = False, mode: str = "", clone_voice: bool | None = None
 ) -> int:
     config = Config.load()
+    config._cli_mode_given = bool(mode)
     if mode:
         config.mode = mode
-    if clone_voice:
-        # Not saved: it is a per-run choice until it has proved itself on this
-        # machine, and a saved "on" that the engine then declines every start
-        # is a worse experience than typing the flag.
-        config.providers.clone_voice = True
+
+    if clone_voice is not None:
+        # None means "no flag was given" - which is the normal case, and leaves
+        # the setting alone. Matching the speaker's voice is on by default and
+        # switches itself off on a machine that cannot keep up, so the flags
+        # are a per-run override rather than the way the feature is reached.
+        config.providers.clone_voice = clone_voice
     if allow_capture:
         # One run only. §2.4 is not a preference, and a saved "off" would sit
         # there quietly until the call where it matters.

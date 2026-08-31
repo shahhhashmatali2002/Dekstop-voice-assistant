@@ -104,6 +104,13 @@ class IncomingPipeline:
         self.clone_max_factor = clone_max_factor
         self._clone_failed = False
         self._clone_ready = False
+
+        #: Until when Urdu is expected to still be sounding in the room. Read
+        #: by the outgoing direction so that, on speakers, our own translation
+        #: is not picked up by the microphone and sent back to the client as
+        #: English. Set from the play loop, because that is the only place that
+        #: knows what has actually been handed to the hardware.
+        self.speaking_until = 0.0
         self._clone_probe: asyncio.Task | None = None
 
         self.context = RollingContext()
@@ -746,6 +753,11 @@ class IncomingPipeline:
 
     # ------------------------------------------------------------------
 
+    @property
+    def is_speaking(self) -> bool:
+        """Is Urdu audible in the room right now (or about to be)?"""
+        return now() < self.speaking_until
+
     def duck(self, on: bool) -> None:
         """Barge-in step 1: attenuate immediately, reversibly (§7.2)."""
         self._ducked = on
@@ -762,6 +774,11 @@ class IncomingPipeline:
         while True:
             item = await self._play_q.get()
             ring = getattr(self.sink, "ring", None)
+
+            # A moment past the end of the block, not exactly the end: the
+            # sink drains it over that time, and cutting the microphone back on
+            # at the last sample means the tail is still in the air.
+            self.speaking_until = max(self.speaking_until, now() + item.ms / 1000.0 + 0.25)
 
             def sounded() -> None:
                 """The listener is now hearing this block."""

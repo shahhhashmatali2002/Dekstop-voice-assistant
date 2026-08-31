@@ -15,13 +15,13 @@ import pytest
 from app.audio.routing import DefaultOutputRouter, RoutingUnavailable
 
 
-def build(previous: str = "speakers-id"):
+def build(previous: str = "speakers-id", mic: str = "real-mic-id"):
     """A router wired to fakes, plus the log of what it set."""
     was_set: list[str] = []
     router = DefaultOutputRouter(
         setter=was_set.append,
-        reader=lambda: previous,
-        resolver=lambda name: f"{name}-id",
+        reader=lambda capture=False: mic if capture else previous,
+        resolver=lambda name, capture=False: f"{name}-id",
     )
     return router, was_set
 
@@ -76,7 +76,9 @@ def test_a_restore_never_raises():
         raise OSError("the device went away")
 
     router = DefaultOutputRouter(
-        setter=explode, reader=lambda: "speakers-id", resolver=lambda n: "x"
+        setter=explode,
+        reader=lambda capture=False: "speakers-id",
+        resolver=lambda n, capture=False: "x",
     )
     with pytest.raises(OSError):
         router.route("CABLE Input")     # routing MAY fail loudly...
@@ -84,11 +86,13 @@ def test_a_restore_never_raises():
 
 
 def test_an_unknown_device_is_reported_not_guessed():
-    def missing(_name):
+    def missing(_name, capture=False):
         raise RoutingUnavailable("no playback device matching 'CABLE Input'")
 
     router = DefaultOutputRouter(
-        setter=lambda _: None, reader=lambda: "speakers-id", resolver=missing
+        setter=lambda _: None,
+        reader=lambda capture=False: "speakers-id",
+        resolver=missing,
     )
     with pytest.raises(RoutingUnavailable):
         router.route("CABLE Input")
@@ -119,12 +123,17 @@ def test_the_default_is_read_from_either_pycaw_shape(monkeypatch):
         id = "{0.0.0.00000000}.{wrapper}"
 
     for shape, expected in ((ComPointer(), "com"), (Wrapper(), "wrapper")):
-        fake = type("AudioUtilities", (), {"GetSpeakers": staticmethod(lambda s=shape: s)})
+        # No enumerator, so it falls through to GetSpeakers - which is the
+        # path where the versions differ.
+        fake = type("AudioUtilities", (), {
+            "GetSpeakers": staticmethod(lambda s=shape: s),
+            "GetDeviceEnumerator": staticmethod(
+                lambda: (_ for _ in ()).throw(OSError("no enumerator"))
+            ),
+        })
         module = type("pycaw", (), {"AudioUtilities": fake})
-        monkeypatch.setitem(
-            __import__("sys").modules, "pycaw.pycaw", module
-        )
-        assert expected in routing.default_output_id()
+        monkeypatch.setitem(__import__("sys").modules, "pycaw.pycaw", module)
+        assert expected in routing.default_endpoint_id()
 
 
 def test_something_with_neither_says_so_clearly(monkeypatch):
@@ -133,10 +142,61 @@ def test_something_with_neither_says_so_clearly(monkeypatch):
     class Neither:
         pass
 
-    fake = type("AudioUtilities", (), {"GetSpeakers": staticmethod(lambda: Neither())})
+    fake = type("AudioUtilities", (), {
+        "GetSpeakers": staticmethod(lambda: Neither()),
+        "GetDeviceEnumerator": staticmethod(
+            lambda: (_ for _ in ()).throw(OSError("no enumerator"))
+        ),
+    })
     module = type("pycaw", (), {"AudioUtilities": fake})
     monkeypatch.setitem(__import__("sys").modules, "pycaw.pycaw", module)
 
     with pytest.raises(RoutingUnavailable) as caught:
-        routing.default_output_id()
+        routing.default_endpoint_id()
     assert "neither GetId() nor .id" in str(caught.value)
+
+
+# ----------------------------------------------------------------------
+# a call needs both flows routed
+# ----------------------------------------------------------------------
+
+
+def test_the_microphone_is_routed_too_so_teams_needs_no_setting_up():
+    """Teams left on "Default" for both then configures itself: the default
+    output is the cable we capture, the default input is the cable we speak
+    into."""
+    router, was_set = build(previous="headphones-id", mic="real-mic-id")
+    router.route("CABLE-B Input")
+    router.route("CABLE-A Output", capture=True)
+    assert was_set == ["CABLE-B Input-id", "CABLE-A Output-id"]
+
+
+def test_both_flows_are_put_back():
+    router, was_set = build(previous="headphones-id", mic="real-mic-id")
+    router.route("CABLE-B Input")
+    router.route("CABLE-A Output", capture=True)
+    router.restore()
+    assert set(was_set[-2:]) == {"headphones-id", "real-mic-id"}
+    assert router.routed is False
+
+
+def test_the_two_flows_are_remembered_separately():
+    """A router that kept one "previous" would restore the microphone over the
+    speaker, or forget one of them entirely."""
+    router, was_set = build(previous="headphones-id", mic="real-mic-id")
+    router.route("CABLE-B Input")
+    router.route("CABLE-A Output", capture=True)
+    router.route("CABLE-B Input")                      # again, mid-call
+    router.route("CABLE-A Output", capture=True)
+    router.restore()
+    assert set(was_set[-2:]) == {"headphones-id", "real-mic-id"}
+
+
+def test_routing_only_the_output_leaves_the_microphone_alone():
+    """One-way listening must not touch the microphone: nothing is being sent
+    anywhere, and taking over the default recording device would affect every
+    other application for no reason."""
+    router, was_set = build()
+    router.route("CABLE Input")
+    router.restore()
+    assert was_set == ["CABLE Input-id", "speakers-id"]

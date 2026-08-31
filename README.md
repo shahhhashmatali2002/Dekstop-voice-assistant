@@ -435,6 +435,38 @@ dictionary in `app/providers/urdu_speech.py`. `--speed` is what the drift
 controller asks for when playback is behind: the voice is asked to read
 faster rather than having its output time-stretched afterwards.
 
+### Before a Teams call
+
+```powershell
+python run.py --call-check      # ready or not, and what to set in Teams
+python run.py --mode meeting    # then press Start with the call already running
+```
+
+`--call-check` opens nothing and calls nobody. It checks the two cables, the
+microphone, the keys for both directions and the echo risk, then prints what
+still has to be set. Run it before the call, not during it.
+
+**A call needs two cables, and they cannot be the same one.**
+
+```
+your voice  → mic → [UR→EN] → CABLE-A Input ═╗
+                                              ╠═► Teams' microphone = CABLE-A Output
+client's voice ← Teams' speaker = CABLE-B Input
+                                              ╚═► captured → [EN→UR] → your headphones
+```
+
+With automatic routing on, Teams can stay on **Default** for both devices —
+the app points the default output at the cable it captures and the default
+*input* at the cable it speaks into, and puts both back on Stop. One cable in
+both roles is allowed but warned about: what we render into it is what we
+capture out of it, so our own English comes back as the client speaking.
+
+**Speakers are allowed.** On speakers your microphone hears the Urdu, so
+`half_duplex` (on by default) ignores the microphone while the Urdu is
+playing — the same trade a speakerphone makes, for the same reason. Talking
+over the translation is ignored while it does. Headphones avoid the compromise
+entirely.
+
 ### Hotkeys
 
 Work while Teams has focus, which is the whole point.

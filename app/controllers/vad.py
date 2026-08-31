@@ -99,8 +99,9 @@ class EnergyDetector:
     a noisy room - that is what Silero is for.
     """
 
-    def __init__(self, threshold_dbfs: float = -45.0) -> None:
+    def __init__(self, threshold_dbfs: float = -65.0) -> None:
         self.threshold_dbfs = threshold_dbfs
+
 
     def probability(self, frame: np.ndarray) -> float:
         if frame.size == 0:
@@ -125,8 +126,9 @@ class VoiceActivityGate:
         detector=None,
         *,
         rate: int = RATE_ASR,
-        threshold: float = 0.5,
-        onset_frames: int = 3,
+        threshold: float = 0.3,
+        onset_frames: int = 1,
+
         hangover_ms: float = 400.0,
         preroll_ms: float = 250.0,
         frame_ms: int = 20,

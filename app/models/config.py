@@ -33,9 +33,19 @@ class DeviceConfig:
     teams_speaker: str = ""  # the render half Teams outputs to; we loopback it
 
     #: Let the application do the routing: while translating, the machine's
-    #: default output is the cable, so whatever is playing is captured without
-    #: anybody opening the volume mixer. Put back on stop and on exit.
+    #: default output is the cable we capture and - in a call - the default
+    #: input is the cable we speak into, so nothing has to be set by hand in
+    #: Windows or in Teams. Both are put back on stop, on close, and from an
+    #: exit hook. ON by default: doing it by hand is the step people give up
+    #: on, and a feature nobody switches on is a feature nobody has.
     auto_route: bool = True
+
+    #: On speakers, ignore the microphone while the Urdu is playing. Without
+    #: it, our own translation is captured, turned back into English and sent
+    #: to the client, louder every pass. Harmless on headphones, where it never
+    #: triggers, so it is on by default.
+    half_duplex: bool = True
+
 
 @dataclass
 class ProviderConfig:
@@ -49,10 +59,11 @@ class ProviderConfig:
 
     #: Speak the Urdu in the voice of whoever is speaking on the source, by
     #: converting the synthesised audio onto a reference learned from the live
-    #: audio. Off by default: it is the only feature here that wants a GPU, and
-    #: on a machine too slow for it the engine refuses rather than falling
-    #: behind - see clone_max_factor.
-    clone_voice: bool = False
+    #: audio. On by default, because it degrades rather than failing: the full
+    #: clone is measured on this machine and, if it cannot keep up, the cheap
+    #: pitch-and-tone match takes over - and that runs anywhere. Only the
+    #: Urdu the user hears is affected; what the client hears is untouched.
+    clone_voice: bool = True
     clone_backend: str = "knn"
 
     #: The most compute per second of audio that may be spent converting before

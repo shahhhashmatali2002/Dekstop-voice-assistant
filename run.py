@@ -21,6 +21,53 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 
+def call_check() -> int:
+    """Meeting-mode readiness. The expensive failures happen mid-call."""
+    from app.models.config import Config
+    from app.controllers.preflight import meeting_preflight
+
+    config = Config.load()
+    manager = None
+    try:
+        from app.audio.devices import DeviceManager
+
+        manager = DeviceManager()
+    except Exception as exc:
+        print(f"\n  note: cannot open the audio stack ({exc}); "
+              "checking the configuration only.")
+
+    # Auto-configuration first, exactly as the application does on startup.
+    # Reading the saved settings alone reports blanks the app would have filled
+    # in the moment it opened - which is how this said "not set" about a cable
+    # installed ten minutes earlier.
+    if manager is not None:
+        from app.controllers.autoconfig import autoconfigure
+
+        try:
+            notes, _problems = autoconfigure(config, manager, save=True)
+            for note in notes:
+                print(f"  set      {note}")
+            if notes:
+                print()
+        except Exception as exc:
+            print(f"  note: could not auto-configure ({exc})")
+
+    report = meeting_preflight(config, manager)
+    print("\n  Teams call readiness\n")
+    print(report.render())
+    print()
+    if report.ok:
+        print("  Ready. Start a call, then press Start in the app.\n")
+    else:
+        print("  Not ready yet - the BLOCKED lines above have to be fixed.\n")
+    if manager is not None:
+        try:
+            manager.close()
+        except Exception:
+            pass
+    return 0 if report.ok else 1
+
+
 def check() -> int:
     ok = True
     print()
@@ -97,8 +144,16 @@ def main() -> int:
                          "understand it - one cable, microphone off. "
                          "'meeting': a two-way Teams call. Asked once and "
                          "remembered if not given.")
+    ap.add_argument("--call-check", action="store_true",
+                    help="is this machine ready to translate a Teams call? "
+                         "Checks the two cables, the microphone, the keys and "
+                         "the echo risk, and prints what to set in Teams. "
+                         "Opens nothing and calls nobody.")
+    ap.add_argument("--no-clone-voice", action="store_true",
+                    help="do not try to match the speaker's voice at all; "
+                         "read everything in the stock Urdu voice")
     ap.add_argument("--clone-voice", action="store_true",
-                    help="speak the Urdu in the voice of whoever is speaking "
+                    help="on by default. Speak the Urdu in the voice of whoever is speaking "
                          "on the source. The voice is learned from the audio "
                          "as it plays, so the first half-minute is in the "
                          "normal voice. The full clone needs a GPU; without "
@@ -111,6 +166,8 @@ def main() -> int:
 
     if args.check:
         return check()
+    if args.call_check:
+        return call_check()
     if args.devices:
         return devices()
 
@@ -134,7 +191,8 @@ def main() -> int:
     return app_main(
         allow_capture=args.allow_capture,
         mode=args.mode or "",
-        clone_voice=args.clone_voice,
+        clone_voice=None if not (args.clone_voice or args.no_clone_voice)
+        else not args.no_clone_voice,
     )
 
 

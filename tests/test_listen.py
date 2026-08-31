@@ -1344,19 +1344,46 @@ def test_the_retired_beta_header_is_never_sent():
     assert headers["Authorization"] == "Bearer sk-test"
 
 
-def test_the_session_declares_its_type():
+def test_the_translation_session_carries_only_the_output_language():
+    """A translation session is not a conversation.
+
+    The live call that found this got as far as:
+
+        Provider error in audio out: Unknown parameter:
+        'session.audio.output.language'
+
+    which reads as "that field is wrong". The field was right; the URL was
+    wrong - we were talking to the voice-agent endpoint, which naturally has
+    no such parameter. Sending the voice-agent's own fields to the translation
+    endpoint fails the same way round, so the session is kept to the one thing
+    that endpoint actually accepts.
+    """
     from app.providers.base import S2stConfig
     from app.providers.openai_s2st import OpenAiSpeechTranslator
 
     cfg = S2stConfig(source_language="ur", target_language="en", rate=24_000)
-    payload = OpenAiSpeechTranslator("sk-test").session_update(cfg)
+    translator = OpenAiSpeechTranslator("sk-test")
+    payload = translator.session_update(cfg)
 
     assert payload["type"] == "session.update"
-    # The GA discriminator. The beta shape had no such field and inferred it
-    # from the header we no longer send.
-    assert payload["session"]["type"] == "realtime"
-    assert payload["session"]["audio"]["output"]["language"] == "en"
-    assert payload["session"]["audio"]["input"]["format"]["rate"] == 24_000
+    session = payload["session"]
+    assert session["audio"]["output"]["language"] == "en"
+    # Only what the translation endpoint documents. Voice-agent fields come
+    # back as "Unknown parameter" and take the whole session with them, and a
+    # rejected session is silence rather than an error.
+    assert set(session) == {"audio"}
+    assert set(session["audio"]) == {"input", "output"}
+    assert "instructions" not in session
+
+
+def test_the_translation_endpoint_is_its_own_path():
+    from app.providers.base import S2stConfig
+    from app.providers.openai_s2st import OpenAiSpeechTranslator
+
+    cfg = S2stConfig(source_language="ur", target_language="en", rate=24_000)
+    url = OpenAiSpeechTranslator("sk-test").url(cfg)
+    assert "/v1/realtime/translations" in url, url
+    assert "model=gpt-realtime-translate" in url
 
 
 def test_the_panel_refits_whenever_its_content_changes():

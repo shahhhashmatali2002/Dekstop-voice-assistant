@@ -545,3 +545,249 @@ def test_the_voice_is_asked_to_slow_down_a_little():
 
     assert EdgeTextToSpeech().speaking_rate.startswith("-")
     assert EdgeTextToSpeech(speaking_rate="+0%").speaking_rate == "+0%"
+
+
+# ----------------------------------------------------------------------
+# a realtime socket that fails must not look like one that is quiet
+# ----------------------------------------------------------------------
+
+
+def test_a_server_error_event_reaches_the_caller():
+    """The bug that killed a live call. The read loop raised
+    ProviderUnavailable for an error event and then discarded it, so a rejected
+    session looked exactly like a working one with nothing to say: audio went
+    in, nothing came out, and not one line was printed anywhere."""
+    import asyncio
+    import json
+
+    from app.providers.base import ProviderUnavailable
+    from app.providers.openai_s2st import OpenAiS2stStream
+
+    class FakeSocket:
+        """Sends one error event, as the API does for a bad session."""
+
+        def __aiter__(self):
+            async def gen():
+                yield json.dumps({
+                    "type": "error",
+                    "error": {"code": "invalid_request_error",
+                              "message": "unknown model 'gpt-realtime-translate'"},
+                })
+            return gen()
+
+        async def send(self, _payload):
+            return None
+
+        async def close(self):
+            return None
+
+    async def run():
+        stream = OpenAiS2stStream(FakeSocket(), 24_000)
+        with pytest.raises(ProviderUnavailable) as caught:
+            async for _chunk in stream.audio_out():
+                pass
+        await stream.aclose()
+        return str(caught.value)
+
+    detail = asyncio.run(run())
+    assert "unknown model" in detail, detail
+
+
+def test_a_rate_limit_is_reported_as_one():
+    import asyncio
+    import json
+
+    from app.providers.base import ProviderRateLimited
+    from app.providers.openai_s2st import OpenAiS2stStream
+
+    class FakeSocket:
+        def __aiter__(self):
+            async def gen():
+                yield json.dumps({
+                    "type": "error",
+                    "error": {"code": "rate_limit_exceeded", "message": "slow down"},
+                })
+            return gen()
+
+        async def send(self, _payload):
+            return None
+
+        async def close(self):
+            return None
+
+    async def run():
+        stream = OpenAiS2stStream(FakeSocket(), 24_000)
+        with pytest.raises(ProviderRateLimited):
+            async for _chunk in stream.audio_out():
+                pass
+        await stream.aclose()
+
+    asyncio.run(run())
+
+
+def test_a_clean_end_of_stream_raises_nothing():
+    """Only a failure is re-raised. A socket that simply closes is the normal
+    end of a session."""
+    import asyncio
+    import json
+
+    from app.providers.openai_s2st import OpenAiS2stStream
+
+    class FakeSocket:
+        def __aiter__(self):
+            async def gen():
+                yield json.dumps({"type": "session.updated"})
+            return gen()
+
+        async def send(self, _payload):
+            return None
+
+        async def close(self):
+            return None
+
+    async def run():
+        stream = OpenAiS2stStream(FakeSocket(), 24_000)
+        chunks = [c async for c in stream.audio_out()]
+        await stream.aclose()
+        return chunks
+
+    assert asyncio.run(run()) == []
+
+
+# ----------------------------------------------------------------------
+# the translation protocol, pinned end to end
+# ----------------------------------------------------------------------
+
+
+def _fake_socket(events):
+    """A socket that replays server events and records what we send."""
+    import json
+
+    class Socket:
+        def __init__(self):
+            self.sent = []
+
+        def __aiter__(self):
+            async def gen():
+                for event in events:
+                    yield json.dumps(event)
+            return gen()
+
+        async def send(self, payload):
+            self.sent.append(json.loads(payload))
+
+        async def close(self):
+            return None
+
+    return Socket()
+
+
+def test_audio_is_appended_with_the_namespaced_event_name():
+    """The whole protocol on this endpoint is namespaced under "session.", and
+    the voice-agent name fails as:
+
+        Invalid value: 'inp...end'. Supported values are: 'session.update',
+        'session.input_audio_buffer.append', and 'session.close'
+
+    Every one of these names fails as SILENCE rather than as an error, which is
+    why they are pinned by tests rather than trusted to a reading."""
+    import asyncio
+
+    import numpy as np
+
+    from app.providers.openai_s2st import APPEND_AUDIO, OpenAiS2stStream
+
+    async def run():
+        socket = _fake_socket([])
+        stream = OpenAiS2stStream(socket, 24_000)
+        await stream.push_audio(np.zeros(240, dtype=np.int16))
+        await stream.aclose()
+        return socket.sent
+
+    sent = asyncio.run(run())
+    assert sent[0]["type"] == APPEND_AUDIO == "session.input_audio_buffer.append"
+    assert "audio" in sent[0]
+
+
+def test_the_session_closes_politely():
+    import asyncio
+
+    from app.providers.openai_s2st import CLOSE_SESSION, OpenAiS2stStream
+
+    async def run():
+        socket = _fake_socket([])
+        stream = OpenAiS2stStream(socket, 24_000)
+        await stream.aclose()
+        return socket.sent
+
+    assert asyncio.run(run())[-1]["type"] == CLOSE_SESSION
+
+
+def test_translated_audio_arrives_on_the_documented_event():
+    import asyncio
+    import base64
+
+    import numpy as np
+
+    from app.providers.openai_s2st import OUTPUT_AUDIO_DELTA, OpenAiS2stStream
+
+    payload = base64.b64encode(
+        np.full(480, 1234, dtype=np.int16).tobytes()
+    ).decode()
+
+    async def run():
+        stream = OpenAiS2stStream(
+            _fake_socket([{"type": OUTPUT_AUDIO_DELTA, "delta": payload}]), 24_000
+        )
+        chunks = [c async for c in stream.audio_out()]
+        await stream.aclose()
+        return chunks
+
+    chunks = asyncio.run(run())
+    assert chunks and chunks[0].pcm.size == 480
+    assert int(chunks[0].pcm[0]) == 1234
+
+
+def test_the_source_transcript_is_never_shown_as_the_translation():
+    """input_transcript is the Urdu that was heard; output_transcript is the
+    English that was produced. Treating both as the translation puts the source
+    language in the transcript window as though it were the result."""
+    import asyncio
+
+    from app.providers.openai_s2st import (
+        INPUT_TRANSCRIPT_DELTA,
+        OUTPUT_TRANSCRIPT_DELTA,
+        OpenAiS2stStream,
+    )
+
+    async def run():
+        stream = OpenAiS2stStream(
+            _fake_socket([
+                {"type": INPUT_TRANSCRIPT_DELTA, "delta": "میں ٹھیک ہوں"},
+                {"type": OUTPUT_TRANSCRIPT_DELTA, "delta": "I am fine"},
+            ]),
+            24_000,
+        )
+        got = [t.text async for t in stream.transcripts()]
+        await stream.aclose()
+        return got
+
+    assert asyncio.run(run()) == ["I am fine"]
+
+
+def test_the_session_matches_the_documented_shape():
+    from app.providers.base import S2stConfig
+    from app.providers.openai_s2st import OpenAiSpeechTranslator
+
+    cfg = S2stConfig(source_language="ur", target_language="en", rate=24_000)
+    session = OpenAiSpeechTranslator("sk-test").session_update(cfg)["session"]
+
+    assert session["audio"]["output"]["language"] == "en"
+    assert session["audio"]["input"]["transcription"]["model"]
+    assert session["audio"]["input"]["noise_reduction"]["type"] == "near_field"
+    # No voice-agent fields: each one comes back as "Unknown parameter" and
+    # takes the whole session with it.
+    assert "type" not in session
+    assert "instructions" not in session
+    assert "turn_detection" not in session
+    assert "modalities" not in session

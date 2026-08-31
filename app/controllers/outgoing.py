@@ -82,12 +82,22 @@ class OutgoingPipeline:
         self._trace = None
         self._running = False
         self._speech_started_at = 0.0
+        self._last_output_time = 0.0
 
     # ------------------------------------------------------------------
 
     @property
+    def is_active(self) -> bool:
+        """True if user is currently speaking Urdu or outgoing English audio is playing."""
+        if getattr(self.gate, "speaking", False):
+            return True
+        return (now() - self._last_output_time) < 1.5
+
+
+    @property
     def running(self) -> bool:
         return self._running
+
 
     def feed(self, pcm: np.ndarray) -> None:
         """Hand in canonical 24 kHz mono int16 from the microphone."""
@@ -145,11 +155,13 @@ class OutgoingPipeline:
                 res = self.gate.push(frame)
 
                 if res.event is SpeechEvent.ONSET:
+                    print("[DEBUG OUTGOING] Speech ONSET detected", flush=True)
                     self._trace = self.traces.new(Direction.OUTGOING)
                     self._trace.mark("frame_sent")
                     self._speech_started_at = now()
                     self._notify_speech(True)
                 elif res.event is SpeechEvent.OFFSET:
+                    print("[DEBUG OUTGOING] Speech OFFSET detected", flush=True)
                     self._notify_speech(False)
 
                 # The realtime translation model requires continuous audio,
@@ -160,9 +172,34 @@ class OutgoingPipeline:
                 if self._stream is not None:
                     try:
                         await self._stream.push_audio(payload)
-                    except ProviderError as exc:
-                        await self._degrade(f"translation stream: {exc}")
-                        return
+                    except Exception as exc:
+                        print(f"[DEBUG OUTGOING] Push audio error: {exc}", flush=True)
+                        try:
+                            await self._restart_stream()
+                            if self._stream is not None:
+                                await self._stream.push_audio(payload)
+                        except Exception as e:
+                            print(f"[DEBUG OUTGOING] Reopen stream error: {e}", flush=True)
+                            await self._degrade(f"translation stream: {exc}")
+                            return
+
+    async def _restart_stream(self) -> None:
+        if self._stream is not None:
+            with contextlib.suppress(Exception):
+                await self._stream.aclose()
+        cfg = S2stConfig(source_language="ur", target_language="en", rate=RATE_S2ST)
+        self._stream = await self.s2st.open(cfg)
+        for t in self._tasks[1:]:
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
+        self._tasks = [
+            self._tasks[0],
+            asyncio.create_task(self._consume_audio(), name="outgoing-out"),
+            asyncio.create_task(self._consume_text(), name="outgoing-text"),
+        ]
+
+
 
     async def _consume_audio(self) -> None:
         assert self._stream is not None
@@ -171,6 +208,7 @@ class OutgoingPipeline:
             async for chunk in self._stream.audio_out():
                 if chunk.pcm.size == 0:
                     continue
+                print(f"[DEBUG OUTGOING] Received audio chunk {chunk.pcm.size} samples", flush=True)
                 if self._trace and first:
                     self._trace.mark("tts_first_chunk")
                 pcm = chunk.pcm
@@ -179,6 +217,8 @@ class OutgoingPipeline:
                 if getattr(self.sink, "channels", 1) > 1:
                     pcm = convert.to_channels(pcm, self.sink.channels)
                 self.sink.write(pcm)
+                self._last_output_time = now()
+
                 if self._trace and first:
                     self._trace.mark("playback_start")
                     self.metrics.record(self._trace)
@@ -187,8 +227,19 @@ class OutgoingPipeline:
         except asyncio.CancelledError:
             raise
         except ProviderError as exc:
+            print(f"[DEBUG OUTGOING] Provider error in audio out: {exc}", flush=True)
+            # Into the transcript window as well as the console: the console is
+            # not where somebody on a call is looking, and a translator that
+            # has quietly stopped translating is the worst thing this can do.
+            if self.on_degrade:
+                with contextlib.suppress(Exception):
+                    self.on_degrade(
+                        "degrade",
+                        f"your Urdu is not reaching the client: {exc}",
+                    )
             await self._degrade(f"translation audio: {exc}")
         except Exception as exc:  # pragma: no cover
+            print(f"[DEBUG OUTGOING] Exception in audio out: {exc}", flush=True)
             await self._degrade(f"translation audio: {exc}")
 
     async def _consume_text(self) -> None:
@@ -197,9 +248,11 @@ class OutgoingPipeline:
             async for delta in self._stream.transcripts():
                 if not delta.text.strip():
                     continue
+                print(f"[DEBUG OUTGOING] Transcript text: {delta.text} (final={delta.is_final})", flush=True)
                 if delta.is_final:
                     self.context.add("you", delta.text)
                 self._emit_transcript(delta.text, delta.is_final)
+
         except asyncio.CancelledError:
             raise
         except Exception:  # pragma: no cover - transcripts are advisory only

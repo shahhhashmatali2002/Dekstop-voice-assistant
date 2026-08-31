@@ -87,7 +87,22 @@ class CaptureSource:
         self._manager = manager
         self.device = manager.resolve(device)
         self.rate = rate or self.device.default_rate
-        self.channels = channels or min(self.device.max_input_channels, 2)
+        # A LOOPBACK endpoint is opened at its NATIVE channel count, not
+        # clamped to two. WASAPI loopback in shared mode delivers the device's
+        # own mix format; asking a virtual 8-channel endpoint - which is what
+        # VoiceMeeter's cables are - for two channels does not downmix it, it
+        # reinterprets eight channels of interleaved samples as four times as
+        # many frames of stereo. The result still has speech-like energy, so
+        # the voice gate happily reports speech, and the recogniser returns
+        # nothing at all because what it received is not speech. Downmixing
+        # happens afterwards, in software, where the channel count is known.
+        #
+        # A real microphone stays clamped: a four-element array has no more
+        # information in channels three and four than in the first two.
+        native = max(1, self.device.max_input_channels)
+        self.channels = channels or (
+            native if getattr(self.device, "is_loopback", False) else min(native, 2)
+        )
         self.frames_per_buffer = frames_per_buffer
         self.stats = StreamStats()
 

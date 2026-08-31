@@ -463,14 +463,33 @@ def test_capturing_the_device_we_render_into_is_refused():
     assert found and "re-enter" in found[0]
 
 
-def test_one_cable_used_for_both_roles_is_refused():
-    cable = _Dev("CABLE Input")
-    from app.audio.devices import feedback_loop_problems
+def test_one_cable_used_for_both_roles_is_warned_about_not_refused():
+    """A deliberate decision, recorded here because it reverses an earlier one.
 
-    found = feedback_loop_problems(
+    It IS a loop - what we render into the cable is what we capture out of it -
+    but refusing it outright meant no two-way mode at all on a machine with one
+    cable. So it opens, and says what the user is about to hear."""
+    cable = _Dev("CABLE Input")
+    from app.audio.devices import feedback_loop_problems, feedback_loop_warnings
+
+    assert not feedback_loop_problems(
+        _Dev("Mic"), _Dev("Headphones"), cable, cable
+    ), "a single-cable setup must still be allowed to open"
+
+    warnings = feedback_loop_warnings(
         _Dev("Mic"), _Dev("Headphones"), cable, cable
     )
-    assert found and "Two separate cables" in found[0]
+    assert warnings and "come back as the client speaking" in warnings[0]
+    assert "VB-CABLE A+B" in warnings[0], "the way out must be named"
+
+
+def test_two_different_cables_warn_about_nothing():
+    from app.audio.devices import feedback_loop_warnings
+
+    assert not feedback_loop_warnings(
+        _Dev("Mic"), _Dev("Headphones"), _Dev("CABLE-A Input"),
+        _Dev("CABLE-B Input"),
+    )
 
 
 def test_a_sane_binding_raises_nothing():
@@ -560,6 +579,98 @@ def test_a_looping_configuration_never_opens_a_stream(monkeypatch):
 # ----------------------------------------------------------------------
 
 
+def test_a_call_routes_the_microphone_as_well_as_the_speaker():
+    """Teams records from the OUTPUT half of the cable we render into, so both
+    flows have to move for Teams to be left on "Default" for both."""
+    from app.controllers.engine import Engine
+
+    moved: list[tuple[str, bool]] = []
+
+    class FakeRouter:
+        def route(self, name, capture=False):
+            moved.append((name, capture))
+            return "previous-id"
+
+        def restore(self):
+            pass
+
+    engine = Engine.__new__(Engine)
+    engine.router = FakeRouter()
+    engine.config = _config_with_route("CABLE-B Input", auto=True)
+    engine.config.mode = "meeting"
+    engine.config.devices.virtual_mic = "CABLE-A Input (VB-Audio Cable A)"
+    engine._notice = lambda *a, **k: None
+
+    # The recording half is found by WIRE - the driver in brackets - not by
+    # replacing "Input" with "Output", which does nothing at all for names
+    # like "CABLE In 16 Ch (2- VB-Audio Virtual Cable)".
+    import app.audio.routing as routing
+
+    original = routing.endpoints
+    routing.endpoints = lambda capture=False: (
+        [("CABLE-A Output (VB-Audio Cable A)", "a-out-id")] if capture else []
+    )
+    try:
+        engine._route_audio()
+    finally:
+        routing.endpoints = original
+
+    assert moved == [
+        ("CABLE-B Input", False),
+        ("CABLE-A Output (VB-Audio Cable A)", True),
+    ], moved
+
+
+def test_one_way_listening_leaves_the_microphone_alone():
+    """Nothing is being sent anywhere, so taking over the default recording
+    device would affect every other application for no reason."""
+    from app.controllers.engine import Engine
+
+    moved: list[tuple[str, bool]] = []
+
+    class FakeRouter:
+        def route(self, name, capture=False):
+            moved.append((name, capture))
+            return "previous-id"
+
+        def restore(self):
+            pass
+
+    engine = Engine.__new__(Engine)
+    engine.router = FakeRouter()
+    engine.config = _config_with_route("CABLE Input", auto=True)
+    engine.config.mode = "video"
+    engine.config.devices.virtual_mic = "CABLE-A Input"
+    engine._notice = lambda *a, **k: None
+
+    engine._route_audio()
+    assert moved == [("CABLE Input", False)], moved
+
+
+def test_a_single_cable_setup_is_warned_about_at_start():
+    from app.controllers.engine import Engine
+
+    said: list[tuple[str, str]] = []
+
+    class FakeRouter:
+        def route(self, name, capture=False):
+            return ""
+
+        def restore(self):
+            pass
+
+    engine = Engine.__new__(Engine)
+    engine.router = FakeRouter()
+    engine.config = _config_with_route("CABLE Input", auto=False)
+    engine.config.mode = "meeting"
+    engine.config.devices.virtual_mic = "CABLE Input"
+    engine.config.devices.teams_speaker = "CABLE Input"
+    engine._notice = lambda severity, message, *a: said.append((severity, message))
+
+    engine._route_audio()
+    assert said and "come back as the client speaking" in said[0][1]
+
+
 def test_the_engine_routes_on_start_and_restores_on_stop():
     """The user's ask: do not make me change Windows settings by hand, and put
     them back when you close."""
@@ -570,7 +681,7 @@ def test_the_engine_routes_on_start_and_restores_on_stop():
     class FakeRouter:
         routed = False
 
-        def route(self, name):
+        def route(self, name, capture=False):
             moved.append(f"route:{name}")
             self.routed = True
             return "speakers-id"
@@ -596,7 +707,7 @@ def test_nothing_is_touched_when_the_user_turned_routing_off():
     moved: list[str] = []
 
     class FakeRouter:
-        def route(self, name):
+        def route(self, name, capture=False):
             moved.append(name)
             return ""
 
@@ -622,7 +733,7 @@ def test_a_routing_failure_is_a_notice_not_a_refusal_to_translate():
     said: list[str] = []
 
     class BrokenRouter:
-        def route(self, name):
+        def route(self, name, capture=False):
             raise RoutingUnavailable("no such device")
 
         def restore(self):
@@ -645,3 +756,382 @@ def _config_with_route(device: str, *, auto: bool):
     config.devices.teams_speaker = device
     config.devices.auto_route = auto
     return config
+
+
+# ----------------------------------------------------------------------
+# half duplex, so speakers do not send our own Urdu back as English
+# ----------------------------------------------------------------------
+
+
+def test_the_microphone_is_ignored_while_the_urdu_is_playing():
+    """The user said speakers must be usable. On speakers the microphone hears
+    the Urdu, so without this it is translated back to English and sent to the
+    client - who hears their own words returned, louder each pass."""
+    from app.controllers.engine import Engine
+    from app.models.config import Config
+
+    engine = Engine.__new__(Engine)
+    engine.config = Config()
+
+    class Speaking:
+        is_speaking = True
+
+    class Quiet:
+        is_speaking = False
+
+    engine._incoming = Speaking()
+    assert engine._muted_by_playback() is True
+
+    engine._incoming = Quiet()
+    assert engine._muted_by_playback() is False
+
+
+def test_half_duplex_can_be_turned_off():
+    """On headphones it never triggers anyway, and somebody with echo
+    cancellation in hardware should be able to talk over the translation."""
+    from app.controllers.engine import Engine
+    from app.models.config import Config
+
+    engine = Engine.__new__(Engine)
+    engine.config = Config()
+    engine.config.devices.half_duplex = False
+
+    class Speaking:
+        is_speaking = True
+
+    engine._incoming = Speaking()
+    assert engine._muted_by_playback() is False
+
+
+def test_nothing_is_muted_when_there_is_no_incoming_pipeline():
+    from app.controllers.engine import Engine
+    from app.models.config import Config
+
+    engine = Engine.__new__(Engine)
+    engine.config = Config()
+    engine._incoming = None
+    assert engine._muted_by_playback() is False
+
+
+# ----------------------------------------------------------------------
+# two endpoints of one cable are not two cables
+# ----------------------------------------------------------------------
+
+
+def test_the_free_vb_cable_counts_as_one_cable_not_two():
+    """Straight off the user's screen. VB-Audio's free driver installs ONE
+    cable and exposes it twice:
+
+        CABLE Input (VB-Audio Virtual Cable)
+        CABLE In 16ch (VB-Audio Virtual Cable)
+
+    Counting endpoints said "this machine has 2" and offered both to the two
+    roles - which is a loop with extra steps, and left somebody certain they
+    had installed a second cable when they had not.
+    """
+    from app.audio.devices import cable_family, distinct_cables
+
+    endpoints = [
+        "CABLE In 16ch (VB-Audio Virtual Cable)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+    ]
+    assert len({cable_family(name) for name in endpoints}) == 1
+    assert distinct_cables(endpoints) == ["CABLE Input (VB-Audio Virtual Cable)"], (
+        "the plain endpoint should be preferred over the 16-channel one"
+    )
+
+
+def test_the_a_plus_b_pack_really_is_two_more():
+    from app.audio.devices import distinct_cables
+
+    got = distinct_cables([
+        "CABLE Input (VB-Audio Virtual Cable)",
+        "CABLE In 16ch (VB-Audio Virtual Cable)",
+        "CABLE-A Input (VB-Audio Cable A)",
+        "CABLE-B Input (VB-Audio Cable B)",
+    ])
+    assert len(got) == 3
+
+
+def test_voicemeeter_cables_are_distinct():
+    from app.audio.devices import distinct_cables
+
+    got = distinct_cables([
+        "VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)",
+        "VoiceMeeter Aux Input (VB-Audio VoiceMeeter AUX VAIO)",
+    ])
+    assert len(got) == 2
+
+
+def test_a_name_with_no_brackets_is_its_own_family():
+    from app.audio.devices import cable_family, distinct_cables
+
+    assert cable_family("Some Cable") == "some cable"
+    assert len(distinct_cables(["Some Cable", "Another Cable"])) == 2
+
+
+def test_the_message_says_cables_not_endpoints():
+    """The count in the refusal has to be cables, and the extra endpoint has
+    to be named as what it is."""
+    from app.controllers.autoconfig import autoconfigure
+    from app.models.config import Config
+    from tests.test_listen import FakeManagerWithDefaults
+
+    cfg = Config()
+    mgr = FakeManagerWithDefaults([
+        "Speaker (Realtek(R) Audio)",
+        "CABLE Input (VB-Audio Virtual Cable)",
+        "CABLE In 16ch (VB-Audio Virtual Cable)",
+    ])
+    _notes, problems = autoconfigure(cfg, mgr, save=False)
+
+    assert len(problems) == 1
+    text = problems[0]
+    assert "has 1 (" in text, text
+    assert "same wire, not a second one" in text, text
+    assert "VB-CABLE A+B" in text
+
+
+# ----------------------------------------------------------------------
+# the free route: VoiceMeeter instead of a paid second cable
+# ----------------------------------------------------------------------
+
+
+class _Endpoint:
+    def __init__(self, name, ins=0, outs=2, loopback=False):
+        self.name = name
+        self._ins = ins
+        self._outs = outs
+        self.is_loopback = loopback
+
+    @property
+    def can_capture(self):
+        return self._ins > 0
+
+    @property
+    def can_render(self):
+        return self._outs > 0
+
+
+class _Manager:
+    def __init__(self, endpoints):
+        self._endpoints = endpoints
+
+    def wasapi_devices(self):
+        return self._endpoints
+
+    def default_input(self):
+        return self._endpoints[-1]
+
+    def default_output(self):
+        return self._endpoints[0]
+
+
+def _realistic_machine():
+    """A Windows machine as PortAudio actually reports it, loopbacks and all."""
+    return [
+        _Endpoint("Speaker (Realtek(R) Audio)", outs=2),
+        _Endpoint("Speaker (Realtek(R) Audio)", ins=2, outs=0, loopback=True),
+        _Endpoint("CABLE Input (VB-Audio Virtual Cable)", outs=2),
+        _Endpoint("CABLE In 16ch (VB-Audio Virtual Cable)", outs=16),
+        _Endpoint("Microphone Array (Intel Smart Sound)", ins=2, outs=0),
+    ]
+
+
+def test_the_microphone_is_never_a_speaker_loopback():
+    """WASAPI exposes a loopback capture endpoint for every playback device,
+    named after it - so "the first device that can capture" is frequently the
+    loopback of the speakers. Chosen as the microphone, the outgoing direction
+    sends the client whatever the machine is playing instead of the user's
+    voice."""
+    from app.controllers.autoconfig import autoconfigure
+    from app.models.config import Config
+
+    config = Config()
+    autoconfigure(config, _Manager(_realistic_machine()), save=False)
+    assert config.devices.microphone == "Microphone Array (Intel Smart Sound)"
+
+
+def test_voicemeeter_provides_the_second_cable_for_free():
+    """The paid A+B pack is not the only way. VoiceMeeter is donationware and
+    exposes its virtual inputs as distinct cables, which is all two-way mode
+    needs."""
+    from app.controllers.autoconfig import autoconfigure
+    from app.models.config import Config
+
+    endpoints = _realistic_machine() + [
+        _Endpoint("VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)", outs=2),
+        _Endpoint("VoiceMeeter Aux Input (VB-Audio VoiceMeeter AUX VAIO)", outs=2),
+    ]
+    config = Config()
+    _notes, problems = autoconfigure(config, _Manager(endpoints), save=False)
+
+    assert problems == [], problems
+    assert config.devices.virtual_mic
+    assert config.devices.teams_speaker
+    assert config.devices.virtual_mic != config.devices.teams_speaker
+
+
+def test_one_cable_alone_still_blocks_with_the_honest_count():
+    from app.controllers.autoconfig import autoconfigure
+    from app.models.config import Config
+
+    config = Config()
+    _notes, problems = autoconfigure(
+        config, _Manager(_realistic_machine()), save=False
+    )
+    assert len(problems) == 1
+    assert "has 1 (" in problems[0]
+
+
+def test_the_machine_this_was_debugged_on():
+    """Every endpoint name here is verbatim from the user's --call-check output
+    after installing VoiceMeeter beside the free VB-CABLE. Three bugs at once:
+
+      * Windows had renamed "CABLE Input (VB-Audio Virtual Cable)" to
+        "Speakers (2- VB-Audio Virtual Cable)", so the saved name resolved to
+        nothing and the report said the cable was missing.
+      * "Speakers (2- ...)" and "CABLE In 16 Ch (2- ...)" are one wire under
+        two names, and a distinctness check that compared strings put one in
+        each role.
+      * Every VoiceMeeter cable reports the same driver in brackets, so
+        grouping by driver collapsed nine usable cables into one.
+    """
+    from app.audio.devices import cable_family
+    from app.controllers.autoconfig import autoconfigure
+    from app.models.config import Config
+
+    endpoints = [
+        _Endpoint("CABLE In 16 Ch (2- VB-Audio Virtual Cable)", outs=16),
+        _Endpoint("Voicemeeter In 3 (VB-Audio Voicemeeter VAIO)", outs=2),
+        _Endpoint("Voicemeeter VAIO3 Input (VB-Audio Voicemeeter VAIO)", outs=2),
+        _Endpoint("Voicemeeter In 4 (VB-Audio Voicemeeter VAIO)", outs=2),
+        _Endpoint("Voicemeeter In 2 (VB-Audio Voicemeeter VAIO)", outs=2),
+        _Endpoint("Speaker (Realtek(R) Audio)", outs=2),
+        _Endpoint("Speaker (Realtek(R) Audio)", ins=2, outs=0, loopback=True),
+        _Endpoint("Voicemeeter In 1 (VB-Audio Voicemeeter VAIO)", outs=2),
+        _Endpoint("Speakers (2- VB-Audio Virtual Cable)", outs=2),
+        _Endpoint("Voicemeeter In 5 (VB-Audio Voicemeeter VAIO)", outs=2),
+        _Endpoint("Voicemeeter Input (VB-Audio Voicemeeter VAIO)", outs=2),
+        _Endpoint("Voicemeeter AUX Input (VB-Audio Voicemeeter VAIO)", outs=2),
+        _Endpoint("Microphone Array (Intel Smart Sound)", ins=2, outs=0),
+    ]
+
+    config = Config()
+    config.devices.microphone = "Microphone Array (Intel Smart Sound)"
+    config.devices.headphones = "Speaker (Realtek(R) Audio)"
+    config.devices.teams_speaker = "CABLE Input (VB-Audio Virtual Cable)"  # gone
+    config.devices.virtual_mic = "CABLE In 16 Ch (2- VB-Audio Virtual Cable)"
+
+    notes, problems = autoconfigure(config, _Manager(endpoints), save=False)
+
+    assert problems == [], problems
+    assert any("no endpoint of that name exists" in note for note in notes)
+    assert config.devices.virtual_mic and config.devices.teams_speaker
+    assert cable_family(config.devices.virtual_mic) != cable_family(
+        config.devices.teams_speaker
+    ), "both roles ended up on the same wire"
+
+
+def test_voicemeeter_cables_are_not_collapsed_into_one():
+    from app.audio.devices import distinct_cables
+
+    got = distinct_cables([
+        "Voicemeeter Input (VB-Audio Voicemeeter VAIO)",
+        "Voicemeeter AUX Input (VB-Audio Voicemeeter VAIO)",
+        "Voicemeeter VAIO3 Input (VB-Audio Voicemeeter VAIO)",
+    ])
+    assert len(got) == 3
+
+
+def test_a_renamed_cable_is_still_the_same_wire():
+    from app.audio.devices import cable_family
+
+    assert cable_family("Speakers (2- VB-Audio Virtual Cable)") == cable_family(
+        "CABLE In 16 Ch (2- VB-Audio Virtual Cable)"
+    )
+
+
+def test_a_16_channel_endpoint_with_a_space_is_recognised():
+    """"16ch" and "16 Ch" are the same thing, and a substring test only caught
+    the first."""
+    from app.audio.devices import distinct_cables
+
+    got = distinct_cables([
+        "CABLE In 16 Ch (2- VB-Audio Virtual Cable)",
+        "Speakers (2- VB-Audio Virtual Cable)",
+    ])
+    assert got == ["Speakers (2- VB-Audio Virtual Cable)"]
+
+
+def test_the_recording_half_of_a_cable_is_found_by_wire():
+    """The exact name from the user's machine, which the string-surgery version
+    left untouched: "CABLE In 16 Ch (2- VB-Audio Virtual Cable)" contains no
+    "Input" to replace, so the default microphone was pointed at a playback
+    device's name and routing reported itself unavailable."""
+    import app.audio.routing as routing
+
+    original = routing.endpoints
+    routing.endpoints = lambda capture=False: (
+        [
+            ("Microphone Array (Intel Smart Sound)", "mic-id"),
+            ("CABLE Output (2- VB-Audio Virtual Cable)", "cable-out-id"),
+        ]
+        if capture
+        else []
+    )
+    try:
+        got = routing.recording_partner("CABLE In 16 Ch (2- VB-Audio Virtual Cable)")
+    finally:
+        routing.endpoints = original
+    assert got == "CABLE Output (2- VB-Audio Virtual Cable)"
+
+
+def test_a_cable_with_no_recording_half_is_reported():
+    import app.audio.routing as routing
+
+    original = routing.endpoints
+    routing.endpoints = lambda capture=False: [("Microphone Array", "mic")]
+    try:
+        with pytest.raises(routing.RoutingUnavailable):
+            routing.recording_partner("CABLE In 16 Ch (2- VB-Audio Virtual Cable)")
+    finally:
+        routing.endpoints = original
+
+
+def test_the_sending_cable_must_have_a_recording_half():
+    """The asymmetry that broke a live call. What we capture FROM Teams is
+    taken by WASAPI loopback off a render endpoint, so any playback cable
+    works. What we SEND to Teams has to appear as a recording device Teams can
+    select - and VoiceMeeter's recording endpoints are mixer buses, not fixed
+    partners of its inputs. Given the VoiceMeeter cable for that role, the
+    client hears nothing from us at all."""
+    from app.audio.devices import cable_family
+    from app.controllers.autoconfig import autoconfigure
+    from app.models.config import Config
+
+    endpoints = [
+        _Endpoint("Speaker (Realtek(R) Audio)", outs=2),
+        _Endpoint("Speakers (2- VB-Audio Virtual Cable)", outs=2),
+        _Endpoint("CABLE In 16 Ch (2- VB-Audio Virtual Cable)", outs=16),
+        _Endpoint("Voicemeeter AUX Input (VB-Audio Voicemeeter VAIO)", outs=2),
+        _Endpoint("Microphone Array (Intel Smart Sound)", ins=2, outs=0),
+        _Endpoint("CABLE Output (2- VB-Audio Virtual Cable)", ins=2, outs=0),
+        _Endpoint("Voicemeeter Out B2 (VB-Audio Voicemeeter VAIO)", ins=2, outs=0),
+    ]
+
+    config = Config()
+    # The broken state from the live attempt: VoiceMeeter in the sending role.
+    config.devices.virtual_mic = "Voicemeeter AUX Input (VB-Audio Voicemeeter VAIO)"
+    config.devices.teams_speaker = "Speakers (2- VB-Audio Virtual Cable)"
+
+    notes, problems = autoconfigure(config, _Manager(endpoints), save=False)
+
+    assert problems == [], problems
+    assert any("no recording half" in note for note in notes)
+    assert cable_family(config.devices.virtual_mic) == cable_family(
+        "CABLE Output (2- VB-Audio Virtual Cable)"
+    ), "the sending role must be the cable that has a capture half"
+    assert cable_family(config.devices.teams_speaker) != cable_family(
+        config.devices.virtual_mic
+    )

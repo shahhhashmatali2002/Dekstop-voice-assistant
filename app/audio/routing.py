@@ -76,31 +76,97 @@ class RoutingUnavailable(RuntimeError):
     """This machine will not let us change the default device."""
 
 
-def endpoint_id(name: str) -> str:
-    """The MMDevice id of a render endpoint whose name contains `name`.
+#: Windows' two data flows. A call needs both: the client's audio comes out of
+#: Teams into a cable we capture, and our English goes into a cable Teams uses
+#: as its microphone.
+RENDER, CAPTURE = 0, 1
+DEVICE_STATE_ACTIVE = 1
 
-    PortAudio, which the rest of the audio layer uses, has no idea what an
-    MMDevice id is - it deals in indices and friendly names - so this is the
-    one place the two worlds are matched up, by name, and the ambiguity that
-    implies is why the match is reported rather than guessed at.
-    """
+
+def _audio_utilities():
     try:
         from pycaw.pycaw import AudioUtilities
+
+        return AudioUtilities
     except ImportError as exc:
         raise RoutingUnavailable(
             "automatic routing needs pycaw:\n"
             "    .venv\\Scripts\\python -m pip install pycaw comtypes"
         ) from exc
 
+
+def endpoints(capture: bool = False) -> list[tuple[str, str]]:
+    """(friendly name, MMDevice id) for every active endpoint of one flow.
+
+    Enumerated per flow rather than filtered afterwards, because a name is not
+    enough to tell a render endpoint from a capture one - "CABLE Input" is a
+    playback device and "CABLE Output" is a recording device, and a virtual
+    cable is precisely a pair with almost the same name.
+    """
+    utilities = _audio_utilities()
+    found: list[tuple[str, str]] = []
+    try:
+        enumerator = utilities.GetDeviceEnumerator()
+        collection = enumerator.EnumAudioEndpoints(
+            CAPTURE if capture else RENDER, DEVICE_STATE_ACTIVE
+        )
+        for index in range(collection.GetCount()):
+            try:
+                device = utilities.CreateDevice(collection.Item(index))
+            except Exception:
+                continue
+            if device is not None and getattr(device, "id", None):
+                found.append((getattr(device, "FriendlyName", "") or "", device.id))
+    except Exception:
+        # Older pycaw, or an enumerator that will not answer: fall back to the
+        # flat list, which is render-only but better than nothing.
+        if capture:
+            raise RoutingUnavailable("could not enumerate recording devices")
+        for device in utilities.GetAllDevices():
+            if getattr(device, "id", None):
+                found.append((getattr(device, "FriendlyName", "") or "", device.id))
+    return found
+
+
+def recording_partner(render_name: str) -> str:
+    """The capture endpoint on the same wire as a render endpoint.
+
+    Not `name.replace("Input", "Output")`, which is what this was first, and
+    which silently does nothing at all for endpoints that do not contain the
+    word - "CABLE In 16 Ch (2- VB-Audio Virtual Cable)" among them. The default
+    microphone was then pointed at a playback device's name, the lookup failed,
+    and the user was told automatic routing was unavailable.
+
+    Matched by wire instead, using the driver in brackets, which is the only
+    part of the two names that is reliably shared.
+    """
+    from app.audio.devices import cable_family
+
+    wanted = cable_family(render_name)
+    for friendly, identifier in endpoints(capture=True):
+        if cable_family(friendly) == wanted:
+            return friendly
+    raise RoutingUnavailable(
+        f"no recording device belongs to the same cable as {render_name!r}"
+    )
+
+
+def endpoint_id(name: str, *, capture: bool = False) -> str:
+    """The MMDevice id of an endpoint whose name contains `name`.
+
+    PortAudio, which the rest of the audio layer uses, has no idea what an
+    MMDevice id is - it deals in indices and friendly names - so this is the
+    one place the two worlds are matched up, by name, and the ambiguity that
+    implies is why the match is reported rather than guessed at.
+    """
     needle = (name or "").lower()
-    hits = []
-    for device in AudioUtilities.GetAllDevices():
-        friendly = (getattr(device, "FriendlyName", "") or "")
-        if needle and needle in friendly.lower() and getattr(device, "id", None):
-            hits.append((friendly, device.id))
-    if not hits:
-        raise RoutingUnavailable(f"no playback device matching {name!r}")
-    return hits[0][1]
+    if not needle:
+        raise RoutingUnavailable("no device name to look for")
+    for friendly, identifier in endpoints(capture=capture):
+        if needle in friendly.lower():
+            return identifier
+    kind = "recording" if capture else "playback"
+    raise RoutingUnavailable(f"no {kind} device matching {name!r}")
 
 
 def _interface(iid: str, reserved: int):
@@ -133,8 +199,12 @@ def _interface(iid: str, reserved: int):
     )
 
 
-def set_default_output(device_id: str) -> None:
+def set_default_endpoint(device_id: str) -> None:
     """Point every role at `device_id`. Raises RoutingUnavailable.
+
+    One function for both flows: SetDefaultEndpoint takes an endpoint id and
+    does not care which direction it belongs to, which is exactly why a
+    microphone can be routed the same way a speaker can.
 
     Tries each known interface layout and keeps the first that actually works -
     "works" meaning the call returned success, not merely that the interface
@@ -174,8 +244,13 @@ def set_default_output(device_id: str) -> None:
     )
 
 
-def default_output_id() -> str:
-    """The current default render endpoint's id, for putting back later.
+#: Kept because the whole application referred to it before there was a second
+#: flow to route.
+set_default_output = set_default_endpoint
+
+
+def default_endpoint_id(capture: bool = False) -> str:
+    """The current default endpoint's id for one flow, to put back later.
 
     pycaw's `GetSpeakers` returns different things in different versions - in
     some it is the raw IMMDevice COM pointer, which has a GetId() method, and
@@ -188,19 +263,22 @@ def default_output_id() -> str:
     a version, because the failure mode of getting it wrong is that the user
     is left routing by hand.
     """
-    try:
-        from pycaw.pycaw import AudioUtilities
-    except ImportError as exc:
-        raise RoutingUnavailable(
-            "automatic routing needs pycaw:\n"
-            "    .venv\\Scripts\\python -m pip install pycaw comtypes"
-        ) from exc
+    AudioUtilities = _audio_utilities()
 
     try:
-        speakers = AudioUtilities.GetSpeakers()
-    except Exception as exc:
-        raise RoutingUnavailable(f"could not read the default output: {exc}")
+        enumerator = AudioUtilities.GetDeviceEnumerator()
+        current = enumerator.GetDefaultAudioEndpoint(
+            CAPTURE if capture else RENDER, 0
+        )
+    except Exception:
+        if capture:
+            raise RoutingUnavailable("could not read the default microphone")
+        try:
+            current = AudioUtilities.GetSpeakers()
+        except Exception as exc:
+            raise RoutingUnavailable(f"could not read the default output: {exc}")
 
+    speakers = current
     getter = getattr(speakers, "GetId", None)
     if callable(getter):
         try:
@@ -219,7 +297,12 @@ def default_output_id() -> str:
 
 
 class DefaultOutputRouter:
-    """Moves the default output to the cable, and always puts it back.
+    """Moves Windows' defaults where we need them, and always puts them back.
+
+    Both flows, because a call needs both. Teams left on "Default" for its
+    speaker and its microphone then needs no configuring at all: the default
+    output becomes the cable we capture, the default input becomes the cable we
+    speak into, and on Stop both go back to whatever the user had.
 
     Written as an object with explicit `route`/`restore` rather than a context
     manager because its lifetime is the translating state of the engine, which
@@ -229,39 +312,40 @@ class DefaultOutputRouter:
     def __init__(self, *, setter=None, reader=None, resolver=None) -> None:
         # Injectable so the behaviour - especially the restore - can be tested
         # on a machine with no Windows audio stack at all.
-        self._set = setter or set_default_output
-        self._read = reader or default_output_id
+        self._set = setter or set_default_endpoint
+        self._read = reader or default_endpoint_id
         self._resolve = resolver or endpoint_id
-        self._previous: str | None = None
+        self._previous: dict[bool, str] = {}
         self._lock = threading.Lock()
         self._registered = False
 
     @property
     def routed(self) -> bool:
-        return self._previous is not None
+        return bool(self._previous)
 
-    def route(self, device_name: str) -> str:
-        """Send everything to `device_name`. Returns what it moved away from.
+    def route(self, device_name: str, *, capture: bool = False) -> str:
+        """Send one flow to `device_name`. Returns what it moved away from.
 
-        Idempotent: routing twice does not overwrite the remembered original
-        with the cable itself, which would make the restore a no-op and leave
-        the machine silent after a stop.
+        Idempotent per flow: routing twice does not overwrite the remembered
+        original with our own cable, which would make the restore a no-op and
+        leave the machine with no working device after a stop.
         """
         with self._lock:
-            target = self._resolve(device_name)
-            if self._previous is None:
-                self._previous = self._read()
+            target = self._resolve(device_name, capture=capture)
+            if capture not in self._previous:
+                self._previous[capture] = self._read(capture=capture)
                 if not self._registered:
                     atexit.register(self.restore)
                     self._registered = True
             self._set(target)
-            return self._previous
+            return self._previous[capture]
 
     def restore(self) -> None:
-        """Put the default back. Safe to call at any time, from anywhere."""
+        """Put every flow we touched back. Safe to call from anywhere, twice."""
         with self._lock:
-            previous, self._previous = self._previous, None
-        if not previous:
-            return
-        with contextlib.suppress(Exception):
-            self._set(previous)
+            previous, self._previous = self._previous, {}
+        for identifier in previous.values():
+            if not identifier:
+                continue
+            with contextlib.suppress(Exception):
+                self._set(identifier)

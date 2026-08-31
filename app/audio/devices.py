@@ -20,6 +20,8 @@ dataclass so that change does not ripple outward.
 
 from __future__ import annotations
 
+import re
+
 import sys
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -278,6 +280,110 @@ def format_device_table(devices: list[DeviceRef]) -> str:
     return "\n".join(d.describe() for d in devices)
 
 
+#: Format markers: the same wire offered at a different channel count. VB-Audio
+#: writes them as "16ch" and as "16 Ch", and the space matters to a substring
+#: test, which is how a 16-channel endpoint was once handed out as a second
+#: cable.
+_FORMAT_MARKER = re.compile(r"\b\d+\s*ch\b|\b(?:input|output|in|out)\b")
+
+
+def _driver(name: str) -> str:
+    """The bracketed part: which DRIVER an endpoint belongs to."""
+    text = name or ""
+    start, end = text.find("("), text.rfind(")")
+    inside = text[start + 1 : end] if 0 <= start < end else text
+    return " ".join(inside.split()).lower()
+
+
+def _prefix(name: str) -> str:
+    """The part before the bracket, with format words removed."""
+    text = name or ""
+    cut = text.find("(")
+    head = text[:cut] if cut > 0 else text
+    head = _FORMAT_MARKER.sub(" ", head.lower())
+    return " ".join(head.split())
+
+
+def cable_family(name: str) -> str:
+    """Which physical cable an endpoint belongs to.
+
+    Two failures taught this function its shape, and they pull in opposite
+    directions.
+
+    ONE WIRE, TWO NAMES. VB-Audio's free driver exposes its single cable twice,
+    and Windows may rename the main endpoint when the driver is re-enumerated:
+
+        Speakers (2- VB-Audio Virtual Cable)
+        CABLE In 16 Ch (2- VB-Audio Virtual Cable)
+
+    Nothing in the visible name says those are the same wire - "Speakers" and
+    "CABLE In 16 Ch" have nothing in common - but the driver in brackets does.
+    Counting them as two cables offers both to the two roles, which is a loop.
+
+    MANY WIRES, ONE NAME. VoiceMeeter is the opposite: every one of its
+    independent virtual cables reports the SAME driver.
+
+        Voicemeeter Input (VB-Audio Voicemeeter VAIO)
+        Voicemeeter AUX Input (VB-Audio Voicemeeter VAIO)
+        Voicemeeter VAIO3 Input (VB-Audio Voicemeeter VAIO)
+
+    Grouping those by driver collapses three usable cables into one and reports
+    a machine with plenty of cables as having none to spare.
+
+    So the driver identifies the cable, EXCEPT for a mixer that multiplexes
+    several onto one driver, where the name before the bracket is what tells
+    them apart. There is no general rule here, only these two - which is why
+    this is a function with a docstring rather than a one-line expression.
+    """
+    driver = _driver(name)
+    if "voicemeeter" in driver:
+        return f"{driver}|{_prefix(name)}"
+    return driver
+
+
+def distinct_cables(names) -> list[str]:
+    """One endpoint per physical cable, keeping the most ordinary of each.
+
+    Prefers a plain endpoint over a multi-channel variant of the same cable: a
+    16-channel endpoint works, but it is a surprising thing to hand somebody
+    when the ordinary one is sitting next to it - and it is the reason a
+    "second cable" once turned out to be the first one wearing a hat.
+    """
+    best: dict[str, str] = {}
+    for name in names:
+        family = cable_family(name)
+        current = best.get(family)
+        if current is None or (_is_multichannel(current) and not _is_multichannel(name)):
+            best[family] = name
+    return list(best.values())
+
+
+def _is_multichannel(name: str) -> bool:
+    return bool(re.search(r"\b\d+\s*ch\b", (name or "").lower()))
+
+
+def feedback_loop_warnings(mic, phones, vmic, teams) -> list[str]:
+    """Bindings that will work badly rather than not at all.
+
+    Separate from `feedback_loop_problems` because the two have different
+    consequences: a problem refuses to open, a warning opens and tells the user
+    what they are about to hear. Mixing them meant either refusing a setup
+    somebody deliberately chose, or saying nothing about a setup that will
+    sound broken.
+    """
+    found: list[str] = []
+    name = lambda d: getattr(d, "name", None)  # noqa: E731
+
+    if vmic is not None and teams is not None and name(vmic) == name(teams):
+        found.append(
+            f"Both virtual cables are set to {name(vmic)!r}. The English we "
+            "generate goes into that cable and we capture the same cable, so "
+            "our own output will come back as the client speaking and be "
+            "translated again. Two separate cables - VB-CABLE A+B - avoid it."
+        )
+    return found
+
+
 def feedback_loop_problems(mic, phones, vmic, teams) -> list[str]:
     """Refuse any binding that feeds a device back into itself.
 
@@ -322,12 +428,13 @@ def feedback_loop_problems(mic, phones, vmic, teams) -> list[str]:
             "virtual cable."
         )
 
-    if vmic is not None and teams is not None and name(vmic) == name(teams):
-        found.append(
-            f"Both virtual cables are set to {name(vmic)!r}. The English we "
-            "generate would be fed straight back into the incoming "
-            "pipeline. Two separate cables are needed."
-        )
+    # One cable in both roles is deliberately NOT refused here. It is a loop -
+    # the English we render into the cable is audio we then capture out of it,
+    # so it comes back as the client speaking - but it is a loop somebody may
+    # choose to accept on a machine with one cable, and refusing outright meant
+    # no two-way mode at all. It is reported by `feedback_loop_warnings` below
+    # instead, so the choice is visible rather than silent.
+
 
     if mic is not None and vmic is not None and name(mic) == name(vmic):
         found.append(
