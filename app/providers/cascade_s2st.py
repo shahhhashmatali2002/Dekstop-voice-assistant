@@ -58,22 +58,32 @@ from app.providers.base import (
 #: What the recogniser wants, regardless of what the pipeline hands us.
 RATE_ASR = 16_000
 
-#: The voice the client hears. An Edge voice, so it costs nothing; override
-#: with ENGLISH_VOICE for a different accent.
-DEFAULT_ENGLISH_VOICE = "en-US-AndrewNeural"
+#: The voice the client hears. An Edge voice by default (costs nothing), or
+#: ElevenLabs voice ID when configured.
+DEFAULT_ENGLISH_VOICE = "en-US-BrianNeural"
+ELEVENLABS_DEFAULT_VOICE = "pNInz6obpgDQGcFmaJgB"  # Adam
+
+
+def english_voice(rate: int, tts_vendor: str = "") -> VoiceId:
+    if tts_vendor.startswith("eleven"):
+        name = (
+            os.environ.get("ELEVENLABS_VOICE_ID")
+            or os.environ.get("ENGLISH_VOICE")
+            or ELEVENLABS_DEFAULT_VOICE
+        )
+        return VoiceId(vendor="elevenlabs", name=name, rate=rate)
+    name = os.environ.get("ENGLISH_VOICE") or DEFAULT_ENGLISH_VOICE
+    return VoiceId(
+        vendor="edge",
+        name=name,
+        rate=rate,
+    )
+
 
 #: Bounded so a stalled consumer cannot grow memory without limit. Audio is
 #: large: sixty chunks is already several seconds of speech.
 AUDIO_QUEUE = 64
 TEXT_QUEUE = 64
-
-
-def english_voice(rate: int) -> VoiceId:
-    return VoiceId(
-        vendor="edge",
-        name=os.environ.get("ENGLISH_VOICE") or DEFAULT_ENGLISH_VOICE,
-        rate=rate,
-    )
 
 
 class CascadeS2stStream(S2stStream):
@@ -248,13 +258,28 @@ class CascadeS2stStream(S2stStream):
                                 source_text=said),
             )
 
-            voice = english_voice(self._cfg.rate)
+            vendor = getattr(self._tts, "name", "edge")
+            voice = english_voice(self._cfg.rate, tts_vendor=vendor)
+            synthesized_any = False
             try:
                 async for chunk in self._tts.synthesize(english, voice):
                     if self._closed or chunk.pcm.size == 0:
                         continue
+                    synthesized_any = True
                     await self._put(self._audio, chunk)
             except Exception as exc:
+                if vendor.startswith("eleven") and not synthesized_any:
+                    try:
+                        from app.providers.tts import EdgeTextToSpeech
+                        fallback_tts = EdgeTextToSpeech()
+                        fallback_voice = english_voice(self._cfg.rate, tts_vendor="edge")
+                        async for chunk in fallback_tts.synthesize(english, fallback_voice):
+                            if self._closed or chunk.pcm.size == 0:
+                                continue
+                            await self._put(self._audio, chunk)
+                        return
+                    except Exception:
+                        pass
                 self.failure = exc
                 with contextlib.suppress(Exception):
                     self._audio.put_nowait(None)
@@ -324,11 +349,13 @@ class CascadeSpeechTranslator(SpeechTranslator):
             raise ProviderMisconfigured(
                 "the cascade needs a recogniser, a translator and a voice"
             )
+        keyterms = self.terminology.keyterms() if self.terminology else []
         asr_stream = await self.asr.open(
             AsrConfig(
                 language=cfg.source_language or "ur",
                 rate=RATE_ASR,
                 interim_results=True,
+                keyterms=keyterms,
             )
         )
         return CascadeS2stStream(

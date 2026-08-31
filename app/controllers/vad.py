@@ -99,7 +99,7 @@ class EnergyDetector:
     a noisy room - that is what Silero is for.
     """
 
-    def __init__(self, threshold_dbfs: float = -65.0) -> None:
+    def __init__(self, threshold_dbfs: float = -50.0) -> None:
         self.threshold_dbfs = threshold_dbfs
 
 
@@ -127,7 +127,7 @@ class VoiceActivityGate:
         *,
         rate: int = RATE_ASR,
         threshold: float = 0.3,
-        onset_frames: int = 1,
+        onset_frames: int = 2,
 
         hangover_ms: float = 400.0,
         preroll_ms: float = 250.0,

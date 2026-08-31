@@ -32,6 +32,8 @@ DEFAULT_LOCKED = [
     "Kubernetes", "Docker", "Jira", "Azure", "AWS", "database", "schema",
     "migration", "frontend", "backend", "pipeline", "build", "release",
     "milestone", "go live", "scope", "requirement", "integration",
+    "software", "job", "developer", "engineer", "remote", "freelance",
+    "office", "manager", "project", "client", "meeting", "company", "Pakistan",
 ]
 
 

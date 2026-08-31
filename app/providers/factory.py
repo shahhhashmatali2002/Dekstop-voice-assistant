@@ -95,7 +95,9 @@ def build_translator(p, *, on_notice=None):
     return ChainTranslator(candidates, on_notice=on_notice)
 
 
-def build_providers(config: Config, *, include_s2st: bool = True) -> dict:
+def build_providers(
+    config: Config, *, include_s2st: bool = True, terminology=None
+) -> dict:
     """Construct the configured provider stack.
 
     `include_s2st` is False for listen mode, which has no outgoing direction:
@@ -141,11 +143,11 @@ def build_providers(config: Config, *, include_s2st: bool = True) -> dict:
         "tts": tts,
     }
     if include_s2st:
-        providers["s2st"] = build_s2st(providers)
+        providers["s2st"] = build_s2st(providers, terminology=terminology)
     return providers
 
 
-def build_s2st(providers: dict):
+def build_s2st(providers: dict, *, terminology=None):
     """The cascade by default. The realtime model only when asked for.
 
     This order is deliberate and it is about money, not quality. The realtime
@@ -175,9 +177,15 @@ def build_s2st(providers: dict):
         return OpenAiSpeechTranslator(openai_key)
 
     from app.providers.cascade_s2st import CascadeSpeechTranslator
+    from app.providers.tts import ElevenLabsTextToSpeech
+
+    eleven_key = get_secret("ELEVENLABS_API_KEY")
+    tts = providers.get("tts")
+    if usable(eleven_key):
+        tts = ElevenLabsTextToSpeech(eleven_key)
 
     return CascadeSpeechTranslator(
-        providers["asr"], providers["translator"], providers["tts"]
+        providers["asr"], providers["translator"], tts, terminology=terminology
     )
 
 

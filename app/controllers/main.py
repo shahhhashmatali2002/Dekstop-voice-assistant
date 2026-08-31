@@ -237,11 +237,15 @@ class Application:
         # at the call site, and one that only Windows ever reaches.
         return AudioPorts(mic, vmic, teams, phones, wires), problems
 
-    def build_providers(self, *, include_s2st: bool = True) -> dict:
+    def build_providers(self, *, include_s2st: bool = True, terminology=None) -> dict:
         """The configured provider stack. Shared with listen mode (§8.6)."""
+        from app.models.terminology import Terminology
         from app.providers.factory import build_providers
 
-        return build_providers(self.config, include_s2st=include_s2st)
+        terms = terminology or Terminology.load(self.config.terminology_path())
+        return build_providers(
+            self.config, include_s2st=include_s2st, terminology=terms
+        )
 
     # ------------------------------------------------------------------
     # UI wiring
@@ -525,17 +529,19 @@ class Application:
         capture_guard.harden(box, unfocusable=False)
         box.exec()
 
+        old_mode = self.config.mode
         clicked = box.clickedButton()
         if clicked is video:
-            self.config.mode = "video"
-            self.config.devices.teams_speaker = ""
-            self.config.devices.virtual_mic = ""
+            new_mode = "video"
         elif clicked is meeting:
-            self.config.mode = "meeting"
-            self.config.devices.teams_speaker = ""
-            self.config.devices.virtual_mic = ""
+            new_mode = "meeting"
         else:
             return False
+
+        if old_mode != new_mode:
+            self.config.mode = new_mode
+            self.config.devices.teams_speaker = ""
+            self.config.devices.virtual_mic = ""
 
         try:
             if self._dm is None:

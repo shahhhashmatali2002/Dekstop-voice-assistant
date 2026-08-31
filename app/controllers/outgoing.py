@@ -101,6 +101,10 @@ class OutgoingPipeline:
 
     def feed(self, pcm: np.ndarray) -> None:
         """Hand in canonical 24 kHz mono int16 from the microphone."""
+        import os
+        gain = float(os.environ.get("MIC_GAIN", "2.0"))
+        if gain != 1.0 and pcm.size > 0:
+            pcm = np.clip(pcm.astype(np.float32) * gain, -32768, 32767).astype(np.int16)
         try:
             self._audio_in.put_nowait(pcm)
         except asyncio.QueueFull:

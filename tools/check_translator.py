@@ -16,6 +16,10 @@ from __future__ import annotations
 import asyncio
 import sys
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, ".")
 
 from app.models.config import Config  # noqa: E402
