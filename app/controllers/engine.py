@@ -440,7 +440,7 @@ class Engine:
     #: How long to translate before saying that nothing is arriving. See the
     #: same constant in listen.py - both entry points need this, because the
     #: failure is in the routing, which neither of them can see.
-    SILENCE_NOTICE_S = 12.0
+    SILENCE_NOTICE_S = 60.0
 
     def _watch_for_silence(self) -> None:
         """Say why nothing is happening, once, instead of showing nothing.
@@ -475,15 +475,37 @@ class Engine:
                 "is not already holding the device."
             ))
         elif pipe.speech_ms < 300.0:
+            # INFO, not a warning, and worded as what it actually means. The
+            # old wording - "there is no speech in it, either the application
+            # is muted or it is playing to a different device" - described a
+            # fault. But the overwhelmingly common cause is that nobody on the
+            # other end has spoken yet, which is not a fault at all. Testing
+            # alone triggers it every single run, and it sent a whole day into
+            # hunting for a broken cable that measured perfect.
+            self._notice("info", (
+                f"Nothing has been said on the other side yet - {source!r} is "
+                "connected and quiet. If someone IS talking and you cannot "
+                "hear them translated, check the Speaker setting inside the "
+                "meeting app."
+            ))
+        elif pipe.speech_ms < 2000.0:
+            # A virtual cable that nothing is playing into still idles a little
+            # above digital silence - this machine's measured -70.6 dB, against
+            # a speech gate that trips around -69 dB. So a few frames of
+            # nothing get counted as speech, and the old wording then blamed
+            # the API key for it. Under two seconds in twelve is not somebody
+            # talking; it is a quiet wire.
             self._notice("warning", (
-                f"Audio is arriving from {source!r} but there is no speech in "
-                "it. Either the application is muted, or it is playing to a "
-                "different device than the one we are listening to."
+                f"Only faint noise is arriving from {source!r} - not speech. "
+                "Nothing is playing into that device: check the Speaker "
+                "setting inside the meeting app, not just Windows."
             ))
         else:
             self._notice("warning", (
-                "Speech is reaching the recogniser but nothing is coming back. "
-                "Check the network and DEEPGRAM_API_KEY."
+                "The recogniser has had several seconds of speech and returned "
+                "nothing. If the client is definitely talking, the audio may be "
+                "too quiet to recognise - check the level with "
+                "tools/check_deepgram.py."
             ))
         self._said_why = True
 

@@ -201,6 +201,56 @@ class OutgoingPipeline:
 
 
 
+    #: Longest we will wait for the sink to make room before writing anyway.
+    #: A sink that has not moved in a second is broken, not busy, and silence
+    #: is a worse failure than a dropped sample.
+    MAX_WAIT_S = 1.0
+
+    async def _write_paced(self, pcm: np.ndarray) -> None:
+        """Write no faster than the sink can play, and never faster.
+
+        MEASURED, not guessed. tools/say_english.py pushed one sentence through
+        this exact path and reported:
+
+            samples written      336384
+            ring dropped          22080
+
+        The sink's ring holds 500 ms. The voice delivers a three-and-a-half
+        second sentence in a fraction of that, and the ring - which never
+        blocks, by design - drops the OLDEST samples to take the newest. So
+        almost the whole sentence was thrown away before the sound card could
+        play it, and what reached the client was a fragment or nothing at all,
+        while the transcript happily showed a complete translation.
+
+        Nothing here costs latency: the first slice goes straight into an empty
+        ring exactly as before. It only stops us overwriting audio the device
+        has not played yet.
+        """
+        ring = getattr(self.sink, "ring", None)
+        if ring is None:
+            self.sink.write(pcm)
+            self._last_output_time = now()
+            return
+
+        index, total, waited = 0, pcm.size, 0.0
+        while index < total and self._running:
+            room = ring.free
+            if room <= 0:
+                if waited >= self.MAX_WAIT_S:
+                    # Not draining at all. Write and take the loss rather than
+                    # wait for room that is never coming.
+                    self.sink.write(pcm[index:])
+                    self._last_output_time = now()
+                    return
+                await asyncio.sleep(0.01)
+                waited += 0.01
+                continue
+            waited = 0.0
+            take = min(room, total - index)
+            self.sink.write(pcm[index : index + take])
+            self._last_output_time = now()
+            index += take
+
     async def _consume_audio(self) -> None:
         assert self._stream is not None
         first = True
@@ -216,8 +266,7 @@ class OutgoingPipeline:
                     pcm = convert.resample(pcm, chunk.rate, self.sink.rate)
                 if getattr(self.sink, "channels", 1) > 1:
                     pcm = convert.to_channels(pcm, self.sink.channels)
-                self.sink.write(pcm)
-                self._last_output_time = now()
+                await self._write_paced(pcm)
 
                 if self._trace and first:
                     self._trace.mark("playback_start")
@@ -251,7 +300,9 @@ class OutgoingPipeline:
                 print(f"[DEBUG OUTGOING] Transcript text: {delta.text} (final={delta.is_final})", flush=True)
                 if delta.is_final:
                     self.context.add("you", delta.text)
-                self._emit_transcript(delta.text, delta.is_final)
+                self._emit_transcript(
+                    delta.text, delta.is_final, source=delta.source_text or ""
+                )
 
         except asyncio.CancelledError:
             raise
@@ -265,13 +316,13 @@ class OutgoingPipeline:
             with contextlib.suppress(Exception):
                 self.on_speech(speaking)
 
-    def _emit_transcript(self, text: str, final: bool) -> None:
+    def _emit_transcript(self, text: str, final: bool, source: str = "") -> None:
         if self.on_transcript:
             with contextlib.suppress(Exception):
                 self.on_transcript(
                     {
                         "direction": Direction.OUTGOING.value,
-                        "source": "",
+                        "source": source,
                         "translated": text,
                         "final": final,
                         "at": now(),

@@ -61,13 +61,20 @@ class PcmChunk:
 
 @dataclass(frozen=True)
 class TranscriptDelta:
-    """Incremental transcript text from a provider that emits one."""
+    """Incremental transcript text from a provider that emits one.
+
+    `text` is always the RESULT - the translation. `source_text` is what was
+    actually said, when the provider knows it. Keeping them in one object is
+    what lets the transcript window show both lines against each other; a
+    provider that cannot report the original simply leaves it None.
+    """
 
     text: str
     is_final: bool = False
     language: str | None = None
     speaker: str | None = None
     at: float = field(default_factory=now)
+    source_text: str | None = None
 
 
 @dataclass

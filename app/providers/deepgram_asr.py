@@ -54,6 +54,28 @@ class DeepgramAsrStream(AsrStream):
         except Exception as exc:  # pragma: no cover
             raise ProviderUnavailable(f"asr send failed: {exc}") from exc
 
+    async def keepalive(self) -> None:
+        """Tell the recogniser we are still here.
+
+        Deepgram closes a stream that has received neither audio nor a text
+        message for ten seconds, with NET-0001:
+
+            "Deepgram did not receive audio data or a text message within the
+             timeout window."
+
+        Every gap in a conversation longer than ten seconds hits that. It must
+        be a TEXT frame, not binary - a binary KeepAlive is documented as
+        mishandled - which is why this cannot just be a chunk of silence, and
+        also why it is better: silence would be transcribed, and billed as
+        audio.
+        """
+        if self._closed:
+            return
+        try:
+            await self._ws.send(json.dumps({"type": "KeepAlive"}))
+        except Exception as exc:
+            raise ProviderUnavailable(f"asr keepalive failed: {exc}") from exc
+
     async def _read_loop(self) -> None:  # pragma: no cover - network path
         try:
             async for raw in self._ws:

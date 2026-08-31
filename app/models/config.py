@@ -278,15 +278,33 @@ SECRET_NAMES = (
 
 
 def missing_secrets(cfg: Config) -> list[str]:
-    """Which credentials the configured provider stack still needs."""
+    """Which credentials the configured provider stack still needs.
+
+    OPENAI_API_KEY is no longer mandatory, and that is the point of this
+    function's shape. Translation needs SOME language model, and Gemini serves
+    one behind an OpenAI-compatible endpoint with a free tier; speech-to-speech
+    needs either the realtime model or the cascade, and the cascade is built
+    from the recogniser and translator that are here anyway. So the
+    requirement is "a translator key of some kind", not "this vendor's key" -
+    otherwise a perfectly working free stack is refused at the door for
+    missing a credential nothing in it uses.
+    """
     need: set[str] = set()
     p = cfg.providers
+
+    translator_keys = ("OPENAI_API_KEY", "GEMINI_API_KEY")
     if p.s2st.startswith("openai") or p.translator.startswith("llm"):
-        need.add("OPENAI_API_KEY")
+        if not any(get_secret(name) for name in translator_keys):
+            need.add(" or ".join(translator_keys))
+
+    # Always, now: the recogniser carries the incoming direction AND, when the
+    # realtime model is unaffordable, the outgoing one too.
     if p.asr.startswith("deepgram"):
         need.add("DEEPGRAM_API_KEY")
     if p.tts.startswith("azure"):
         need.update({"AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION"})
     if p.tts.startswith("eleven"):
         need.add("ELEVENLABS_API_KEY")
-    return sorted(n for n in need if not get_secret(n))
+    # An entry containing " or " has already been decided above; only single
+    # names are looked up here.
+    return sorted(n for n in need if " or " in n or not get_secret(n))

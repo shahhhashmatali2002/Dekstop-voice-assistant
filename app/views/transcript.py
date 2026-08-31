@@ -243,11 +243,20 @@ class TranscriptWindow(OverlayWindow):
             self._last_direction = direction
             return
 
+        # Labelled, not merely greyed. Two lines of different languages with
+        # no labels leave the reader guessing which one the app produced -
+        # and when the recogniser mishears, an unlabelled original reads as a
+        # translation into the wrong language.
         if source and self.show_source.isChecked():
-            self._new_block(is_rtl(source), indent=14)
+            self._new_block(False, indent=14)
+            self._append("Original: ", self._fmt("#6C7481", bold=True))
+            self._new_block(is_rtl(source), indent=28)
             self._append_highlighted(source, self._fmt("#9AA0A6"))
         if translated:
-            self._new_block(is_rtl(translated), indent=14)
+            if source and self.show_source.isChecked():
+                self._new_block(False, indent=14)
+                self._append("Translation: ", self._fmt("#6C7481", bold=True))
+            self._new_block(is_rtl(translated), indent=28 if source else 14)
             self._append_highlighted(translated, self._fmt("#E8EAED"))
         self._last_direction = direction
 
