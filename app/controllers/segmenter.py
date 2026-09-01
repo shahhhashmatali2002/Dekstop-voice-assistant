@@ -15,6 +15,12 @@ that emits translation units at natural boundaries:
       (a) the recogniser marks the hypothesis final
       (b) the prefix has been stable for >= stable_ms
           AND ends at a clause boundary
+      (b2) the prefix has been stable for >= stable_ms, ends at a SOFT
+           boundary (a comma), and is at least soft_min_words long -
+           fluent speech produces commas for whole minutes at a time
+           without a single full stop, and waiting for one means every
+           unit is cut by max_words instead, seconds after the clause
+           was actually finished
       (c) the pending text has grown past max_words
       (d) VAD reports end of speech
 
@@ -236,10 +242,12 @@ class Segmenter:
         stable_ms: float = 350.0,
         max_words: int = 12,
         min_words: int = 3,
+        soft_min_words: int = 6,
     ) -> None:
         self.stability = StabilityFilter(min_hypotheses, stable_ms)
         self.max_words = max_words
         self.min_words = min_words
+        self.soft_min_words = soft_min_words
         self._emitted = ""  # frozen; never revisited - WITHIN one utterance
         self._last_spoken = ""  # the previous utterance, to catch repeat finals
         self._normal: tuple[float, int] | None = None  # settings held during a hurry
@@ -347,6 +355,24 @@ class Segmenter:
                 units.append(Unit(rest, "stable", hyp.at, hyp.speaker))
                 self._emitted = (self._emitted + " " + rest).strip()
                 self._settle()
+            return units
+
+        # Rule (b2): stable AND ends at a soft boundary, with enough words
+        # that the clause stands alone as a translation unit. This is what
+        # keeps CONTINUOUS speech flowing: a fluent speaker produces clause
+        # after clause separated by commas, and a segmenter that only knows
+        # hard punctuation sits on all of it until max_words truncates the
+        # thought mid-clause. The word floor is higher than min_words on
+        # purpose - "yes," alone is worth holding for its sentence, while a
+        # six-word clause is already worth hearing.
+        if (
+            rest
+            and rest[-1] in SOFT_ENDS
+            and len(rest.split()) >= self.soft_min_words
+        ):
+            units.append(Unit(rest, "soft", hyp.at, hyp.speaker))
+            self._emitted = (self._emitted + " " + rest).strip()
+            self._settle()
         return units
 
     def flush(self, reason: str = "vad") -> list[Unit]:

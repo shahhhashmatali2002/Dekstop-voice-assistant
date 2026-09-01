@@ -98,12 +98,18 @@ class CascadeS2stStream(S2stStream):
     """One session: audio in, translated audio and text out."""
 
     def __init__(self, asr_stream, translator, tts, *, cfg: S2stConfig,
-                 terminology=None) -> None:
+                 terminology=None, reopen=None) -> None:
         self._asr = asr_stream
         self._translator = translator
         self._tts = tts
         self._cfg = cfg
         self._terminology = terminology
+        #: Dials a fresh recogniser stream with the session's own settings.
+        #: Recovery lives INSIDE the session because the alternative was
+        #: watched happening: the recogniser hangs up (NET-0001 after a
+        #: network stall), the reader ends quietly, and the death is only
+        #: discovered when a push fails - ten seconds of speech later.
+        self._reopen = reopen
         self._context = RollingContext()
 
         self._audio: asyncio.Queue = asyncio.Queue(maxsize=AUDIO_QUEUE)
@@ -111,10 +117,43 @@ class CascadeS2stStream(S2stStream):
         self._closed = False
         self.failure: Exception | None = None
 
-        #: Serialises translation and synthesis. Two utterances synthesised at
-        #: once arrive interleaved at the sink, which is heard as two people
-        #: talking over each other in one voice.
+        #: Two locks, not one, and the split is the pipeline. `_speaking`
+        #: serialises synthesis - two utterances synthesised at once arrive
+        #: interleaved at the sink, heard as two people talking over each
+        #: other in one voice. `_translating` serialises the translator so
+        #: the rolling context stays in spoken order. Holding ONE lock across
+        #: both stages (as this originally did) meant utterance N+1's
+        #: translation could not start until N had finished SYNTHESISING,
+        #: so every utterance paid its predecessor's whole tail - during
+        #: fluent speech, seconds per utterance, compounding.
         self._speaking = asyncio.Lock()
+        self._translating = asyncio.Lock()
+        #: Consecutive translation failures. One slow or failed round trip
+        #: skips ONE utterance; only a run of them means the translator is
+        #: actually down. Watched happening: a single translation past its
+        #: deadline used to kill the whole outgoing direction mid-call.
+        self._translate_failures = 0
+        #: Clause-level segmentation over the recogniser's INTERIMS, exactly
+        #: as the incoming pipeline does it. The original design here trusted
+        #: Deepgram's is_final alone, and its chunk boundaries are arbitrary:
+        #: fluent speech was cut into "I have recently" / "done graduation
+        #: in AI" and each fragment translated and spoken as though it were
+        #: a sentence. The segmenter's duplication bugs that once justified
+        #: trusting is_final have since been fixed where the incoming
+        #: pipeline lives on it. CASCADE_SEGMENTER=0 restores the old
+        #: behaviour for A/B testing on a live call.
+        self._segmenter = None
+        if (os.environ.get("CASCADE_SEGMENTER") or "1").strip().lower() not in (
+            "0", "off", "false", "no",
+        ):
+            from app.controllers.segmenter import Segmenter
+
+            self._segmenter = Segmenter(
+                min_hypotheses=2,
+                stable_ms=250.0,
+                max_words=14,
+                soft_min_words=6,
+            )
         self._jobs: set[asyncio.Task] = set()
         self._last_push = 0.0
         self._pushed_ms = 0.0
@@ -124,7 +163,10 @@ class CascadeS2stStream(S2stStream):
     # ---------------------------------------------------------------- input
 
     async def push_audio(self, pcm: np.ndarray) -> None:
-        if self._closed:
+        if self._closed or self._asr is None:
+            # Mid-reopen. Dropping a frame here is the whole cost of the
+            # reconnect; raising instead would tear down the pipeline the
+            # reopen is about to save.
             return
         if pcm.dtype != DTYPE:
             pcm = pcm.astype(DTYPE)
@@ -146,20 +188,23 @@ class CascadeS2stStream(S2stStream):
         thing said is lost while the stream reconnects. The pause between
         sentences in a real meeting is routinely longer than ten seconds.
         """
-        keepalive = getattr(self._asr, "keepalive", None)
-        if keepalive is None:
-            return
         while not self._closed:
             await asyncio.sleep(self.KEEPALIVE_EVERY_S / 2.0)
             if self._closed:
                 return
             if time.monotonic() - self._last_push < self.KEEPALIVE_EVERY_S:
                 continue
+            # Looked up per beat, not once: after an in-place reopen the
+            # stream object is a different one, and a keepalive bound at
+            # start-up would be dutifully keeping a corpse warm.
+            keepalive = getattr(self._asr, "keepalive", None)
+            if keepalive is None:
+                continue
             try:
                 await keepalive()
             except Exception:
                 # The reader owns the connection's health and will report it.
-                return
+                continue
 
     # --------------------------------------------------------------- output
 
@@ -198,14 +243,48 @@ class CascadeS2stStream(S2stStream):
     #: look identical from outside.
     REPORT_EVERY_S = 10.0
 
+    #: Consecutive failed translations before the outgoing direction is
+    #: declared dead rather than merely unlucky.
+    TRANSLATE_FAILURES_FATAL = 3
+
+    #: Consecutive failed redials before the session is declared dead. A
+    #: dropped socket is ordinary - a network stall, a provider node
+    #: restarting - and ending the call for one is the worse answer.
+    RECONNECT_ATTEMPTS = 3
+
+    async def _reopen_asr(self, attempt: int) -> bool:
+        """Dial the recogniser again, in place. False when it will not answer."""
+        if self._reopen is None:
+            return False
+        await asyncio.sleep(min(2.0, 0.3 * attempt))
+        old_stream, self._asr = self._asr, None
+        if old_stream is not None:
+            with contextlib.suppress(Exception):
+                await old_stream.aclose()
+        try:
+            self._asr = await self._reopen()
+        except Exception:
+            return False
+        print(
+            "[DEBUG ASR] recogniser stream reopened after a drop - a few "
+            "words around the gap may be lost",
+            flush=True,
+        )
+        return True
+
     async def _read_hypotheses(self) -> None:
         import os
 
         verbose = (os.environ.get("DEBUG_ASR") or "").lower() in ("1", "true", "on")
         interims = finals = 0
         last_report = time.monotonic()
+        failures = 0
         try:
-            async for hypothesis in self._asr.hypotheses():
+          while not self._closed:
+            broke: Exception | None = None
+            try:
+              async for hypothesis in self._asr.hypotheses():
+                failures = 0
                 text = (hypothesis.text or "").strip()
 
                 if hypothesis.is_final:
@@ -245,18 +324,40 @@ class CascadeS2stStream(S2stStream):
                 # into the wrong language, when it had not translated yet at
                 # all. The realtime model has the same two channels and only
                 # ever sends its OUTPUT transcript here; this must match.
+                if self._segmenter is not None:
+                    from app.controllers.segmenter import Hypothesis
+
+                    for unit in self._segmenter.push(
+                        Hypothesis(text, hypothesis.is_final, hypothesis.at)
+                    ):
+                        self._speak_unit(unit.text, hypothesis.language)
+                    continue
+
                 if not hypothesis.is_final:
                     continue
 
-                job = asyncio.create_task(
-                    self._speak_translation(text, hypothesis.language)
-                )
-                self._jobs.add(job)
-                job.add_done_callback(self._jobs.discard)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.failure = exc
+                self._speak_unit(text, hypothesis.language)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                broke = exc
+                self.failure = exc
+
+            # A CLEAN end is the provider (or our own close) saying the
+            # session is over - ending with it is correct. Only an ABNORMAL
+            # end - the recogniser hanging up mid-session, surfaced as an
+            # exception - is worth redialling, keeping the translator, the
+            # synthesis queue and everything downstream: the alternative is
+            # a quiet death discovered only when a push fails, ten lost
+            # seconds later.
+            if self._closed or broke is None:
+                break
+            failures += 1
+            if failures > self.RECONNECT_ATTEMPTS:
+                break
+            if not await self._reopen_asr(failures):
+                break
+            self.failure = None
         finally:
             # The recogniser is finished, but utterances it already produced
             # may still be mid-translation or mid-synthesis. Closing the audio
@@ -272,6 +373,12 @@ class CascadeS2stStream(S2stStream):
                 self._audio.put_nowait(None)
             with contextlib.suppress(Exception):
                 self._text.put_nowait(None)
+
+    def _speak_unit(self, text: str, language: str | None) -> None:
+        """Hand one confirmed span of source speech to translate-and-speak."""
+        job = asyncio.create_task(self._speak_translation(text, language))
+        self._jobs.add(job)
+        job.add_done_callback(self._jobs.discard)
 
     async def _speak_translation(
         self, said: str, heard_language: str | None = None
@@ -289,12 +396,15 @@ class CascadeS2stStream(S2stStream):
         their own voice. Nothing said in the target language is worth a round
         trip through a model that is free to disagree with it.
         """
-        async with self._speaking:
+        target = self._cfg.target_language
+        source = (heard_language or self._cfg.source_language or "ur").strip()
+
+        # Stage one: translation, serialised only against other translations.
+        # Utterance N+1 gets here while N is still inside `_speaking` below,
+        # which is what lets its round trip overlap N's synthesis.
+        async with self._translating:
             if self._closed:
                 return
-
-            target = self._cfg.target_language
-            source = (heard_language or self._cfg.source_language or "ur").strip()
 
             if source.split("-")[0] == target.split("-")[0]:
                 english = said.strip()
@@ -311,18 +421,36 @@ class CascadeS2stStream(S2stStream):
                         unit, self._context, self._terminology
                     )
                 except ProviderError as exc:
-                    self.failure = exc
-                    with contextlib.suppress(Exception):
-                        self._audio.put_nowait(None)
+                    self._translate_failures += 1
+                    if self._translate_failures >= self.TRANSLATE_FAILURES_FATAL:
+                        self.failure = exc
+                        with contextlib.suppress(Exception):
+                            self._audio.put_nowait(None)
+                        return
+                    print(
+                        f"[DEBUG OUTGOING] translation failed for one "
+                        f"utterance ({exc}) - skipped, the stream continues",
+                        flush=True,
+                    )
                     return
                 except Exception:
                     return
+                self._translate_failures = 0
 
                 english = (translated.text or "").strip()
                 if not english:
                     return
 
             self._context.add("you", english)
+
+        # Stage two: synthesis, in the order stage one finished. A job can
+        # only reach this acquire after its predecessor released
+        # `_translating`, and that predecessor queues for `_speaking` before
+        # yielding - so the order the utterances were heard in is the order
+        # they are spoken in.
+        async with self._speaking:
+            if self._closed:
+                return
             # Both halves, together: this path heard the Urdu and produced
             # the English, so the window can show them one under the other.
             await self._put(
@@ -430,18 +558,18 @@ class CascadeSpeechTranslator(SpeechTranslator):
                 "the cascade needs a recogniser, a translator and a voice"
             )
         keyterms = self.terminology.keyterms() if self.terminology else []
-        asr_stream = await self.asr.open(
-            AsrConfig(
-                language=cfg.source_language or "ur",
-                rate=RATE_ASR,
-                interim_results=True,
-                keyterms=keyterms,
-            )
+        asr_cfg = AsrConfig(
+            language=cfg.source_language or "ur",
+            rate=RATE_ASR,
+            interim_results=True,
+            keyterms=keyterms,
         )
+        asr_stream = await self.asr.open(asr_cfg)
         return CascadeS2stStream(
             asr_stream,
             self.translator,
             self.tts,
             cfg=cfg,
             terminology=self.terminology,
+            reopen=lambda: self.asr.open(asr_cfg),
         )

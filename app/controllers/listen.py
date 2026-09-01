@@ -112,19 +112,19 @@ DEGRADED = "degraded"  # a provider failed; English audible again
 #: on you, so let the lag sit where it lands and keep the voice clean.
 PRESETS = {
     "fluent": dict(
-        stability_ms=500.0, max_words=28, vad_hangover_ms=600.0,
+        stability_ms=500.0, max_words=28, soft_min_words=14, vad_hangover_ms=600.0,
         playback_preroll_ms=400.0,
         drift_comfortable_ms=4000.0, drift_stretch_ms=12000.0,
         drift_aggressive_ms=25000.0, drift_max_rate=1.08,
     ),
     "balanced": dict(
-        stability_ms=300.0, max_words=18, vad_hangover_ms=400.0,
+        stability_ms=300.0, max_words=18, soft_min_words=8, vad_hangover_ms=400.0,
         playback_preroll_ms=300.0,
         drift_comfortable_ms=2000.0, drift_stretch_ms=6000.0,
         drift_aggressive_ms=12000.0, drift_max_rate=1.12,
     ),
     "fast": dict(
-        stability_ms=150.0, max_words=10, vad_hangover_ms=300.0,
+        stability_ms=150.0, max_words=10, soft_min_words=5, vad_hangover_ms=300.0,
         playback_preroll_ms=200.0,
         drift_comfortable_ms=800.0, drift_stretch_ms=2500.0,
         drift_aggressive_ms=5000.0, drift_max_rate=1.20,
@@ -557,6 +557,7 @@ class ListenEngine:
                 min_hypotheses=p.stability_hypotheses,
                 stable_ms=p.stability_ms,
                 max_words=p.max_words,
+                soft_min_words=getattr(p, "soft_min_words", 6),
             ),
             drift=DriftController(
                 comfortable_ms=p.drift_comfortable_ms,

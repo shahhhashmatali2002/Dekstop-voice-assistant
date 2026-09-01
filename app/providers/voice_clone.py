@@ -259,6 +259,15 @@ class KnnVoiceConverter(VoiceConverter):
     RATE = 16_000
     preferred_reference_s = 150.0
 
+    #: One loaded model per process, shared by every instance. A new
+    #: converter is built each time translation starts, and reloading a
+    #: gigabyte of weights per Start press was measured doing real damage:
+    #: the load holds the GIL in bursts, the audio loop freezes for seconds
+    #: (the stall watchdog printed 3.0s and 5.0s), and Deepgram closes both
+    #: directions with NET-0001 - blamed, naturally, on the network.
+    _shared_model = None
+    _shared_key = None
+
     def __init__(self, device: str = "", topk: int = 4, prematched: bool = True):
         self._device = device
         self.topk = topk
@@ -273,6 +282,11 @@ class KnnVoiceConverter(VoiceConverter):
 
     def _load(self):
         if self._model is not None:
+            return self._model
+        cls = type(self)
+        key = (self.device, self.prematched)
+        if cls._shared_model is not None and cls._shared_key == key:
+            self._model = cls._shared_model
             return self._model
         try:
             import torch  # noqa: F401
@@ -296,6 +310,7 @@ class KnnVoiceConverter(VoiceConverter):
             raise ProviderUnavailable(
                 f"could not load the kNN-VC model: {exc}"
             ) from exc
+        cls._shared_model, cls._shared_key = self._model, key
         return self._model
 
     # ------------------------------------------------------------------
@@ -345,6 +360,15 @@ class KnnVoiceConverter(VoiceConverter):
             raise ProviderUnavailable(f"voice conversion failed: {exc}") from exc
 
         out = np.asarray(out.detach().cpu().numpy(), dtype=np.float32).reshape(-1)
+        # SEEN IN A LIVE CALL: the model returned NaNs, and NaN.astype(int16)
+        # is not silence - it is whatever bit pattern the cast lands on,
+        # heard as harsh digital garbage in place of the whole utterance.
+        # A clone that cannot produce a number has nothing to offer over the
+        # audio it was given; hand that back unchanged instead.
+        if out.size == 0 or not np.all(np.isfinite(out)):
+            raise ProviderUnavailable(
+                "voice conversion produced non-finite audio"
+            )
         peak = float(np.max(np.abs(out))) if out.size else 0.0
         if peak > 1.0:
             out = out / peak

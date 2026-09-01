@@ -184,6 +184,40 @@ def test_code_switched_sentence_survives_segmentation():
     assert "staging" in units[0].text and "deploy" in units[0].text
 
 
+def test_soft_boundary_emits_a_long_enough_clause():
+    """Fluent speech is commas for minutes at a time - a clause that ends at
+    a comma and is long enough to stand alone must not wait for a full stop
+    or the max_words axe."""
+    seg = Segmenter(min_hypotheses=1, stable_ms=0, soft_min_words=4)
+    text = "so today we are looking at the pipeline,"
+    units = feed(seg, [text, text])
+    assert units, "a stable clause ending at a comma must be emitted"
+    assert units[0].reason == "soft"
+    assert units[0].text.endswith(",")
+
+
+def test_soft_boundary_holds_a_short_clause():
+    """"yes," is worth holding for its sentence - the soft rule needs more
+    words than the hard rule before it fires."""
+    seg = Segmenter(min_hypotheses=1, stable_ms=0, soft_min_words=6)
+    units = feed(seg, ["well yes,", "well yes,"])
+    assert units == []
+
+
+def test_soft_emission_is_not_repeated_by_the_final():
+    """What the comma rule emitted must not be spoken again when the
+    recogniser finalises the whole sentence."""
+    seg = Segmenter(min_hypotheses=1, stable_ms=0, soft_min_words=4)
+    clause = "so today we are looking at the pipeline,"
+    feed(seg, [clause, clause])
+    units = seg.push(Hypothesis(
+        "so today we are looking at the pipeline, and then the tests.",
+        is_final=True,
+    ))
+    assert len(units) == 1
+    assert units[0].text.strip() == "and then the tests."
+
+
 def test_unit_word_count():
     seg = Segmenter()
     u = seg.push(Hypothesis("one two three", is_final=True))[0]

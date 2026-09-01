@@ -293,8 +293,12 @@ def test_the_last_sentence_is_not_cut_off_when_the_recogniser_finishes():
 def test_a_dead_translator_is_reported_not_swallowed():
     """A translator that has stopped answering must not present as a
     translator that heard nothing. Silence is the failure this project has
-    lost the most time to."""
-    asr = FakeAsr([final("کچھ")])
+    lost the most time to.
+
+    "Stopped answering" now means a RUN of failures, not one: a single round
+    trip past its deadline skips one utterance (see the test below), because
+    a slow moment on a free-tier API must not end the call."""
+    asr = FakeAsr([final("ایک۔"), final("دو۔"), final("تین۔")])
     translator = FakeTranslator(fail=ProviderUnavailable("no credits remaining"))
 
     async def run():
@@ -306,6 +310,30 @@ def test_a_dead_translator_is_reported_not_swallowed():
         await stream.aclose()
 
     asyncio.run(run())
+
+
+def test_one_failed_translation_skips_only_that_utterance():
+    """A deadline miss on one utterance must not kill the outgoing
+    direction - watched happening on a live call."""
+
+    class FlakyTranslator(FakeTranslator):
+        async def translate(self, unit, ctx, terms=None):
+            self.calls.append(unit.text)
+            if len(self.calls) == 1:
+                raise ProviderUnavailable("translation exceeded deadline")
+            return TranslatedUnit(unit.text.upper(), unit)
+
+    asr = FakeAsr([final("alpha one."), final("beta two.")])
+    translator = FlakyTranslator()
+
+    async def run():
+        provider = CascadeSpeechTranslator(asr, translator, FakeTts())
+        return await drain(await provider.open(cfg()))
+
+    audio, text = asyncio.run(run())
+    spoken = [d.text for d in text]
+    assert spoken == ["BETA TWO."]
+    assert audio, "the surviving utterance must still be synthesised"
 
 
 def test_a_dead_voice_is_reported_not_swallowed():

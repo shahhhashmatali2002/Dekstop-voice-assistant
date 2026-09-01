@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import os
 import re
+from collections import deque
 
 from app.models.telemetry import now
 from app.providers.base import (
@@ -54,6 +55,11 @@ Render EVERY sentence, in the order given. Never summarise, never condense, \
 never translate only the last part and never drop a sentence because it \
 sounds like a greeting or an introduction. If the input has four sentences, \
 your output has four sentences.
+2b. Some requests carry earlier conversation as context. That text has \
+ALREADY been translated and ALREADY been spoken aloud. NEVER let any of it \
+into your output - no recap, no summary, no re-translation, no merging it \
+with the new text. Even when the new text is a fragment that continues a \
+context sentence, output the fragment's translation ALONE.
 3. NEVER add or embellish. If input is empty or unintelligible, return empty string.
 4. Speak as the speaker, in the first person. You ARE the voice.
 5. WRITE FOR THE EAR. Natural spoken {target}.
@@ -116,6 +122,17 @@ def looks_truncated(source: str, translated: str, *, floor: float = 0.4) -> bool
     return source_words >= 8 and len(translated.split()) < floor * source_words
 
 
+#: Sentence boundary in either script, for the repeat guard below.
+SENTENCE_SPLIT = re.compile(r"(?<=[.!?\u06d4\u061f\u2026])\s+")
+
+#: Trailing marks stripped before comparing sentences across units.
+_TRIM = ".!?\u06d4\u061f\u2026\u060c,;: "
+
+
+def _norm_sentence(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip(_TRIM)).lower()
+
+
 class LlmTranslator(Translator):
     """OpenAI-compatible chat completion used as a steerable translator.
 
@@ -130,7 +147,11 @@ class LlmTranslator(Translator):
         api_key: str | None = None,
         model: str = "gpt-4o-mini",
         base_url: str | None = None,
-        timeout_s: float = 15.0,
+        # The deadline is part of the latency budget, not just a hang guard:
+        # with translations running ahead of playback, one stuck call holds
+        # the speaking order hostage for its whole timeout. Eight seconds is
+        # already far beyond anything a listener will wait through.
+        timeout_s: float = 8.0,
         max_output_tokens: int = 300,
         retry_truncated: bool = True,
     ) -> None:
@@ -141,6 +162,10 @@ class LlmTranslator(Translator):
         self.max_output_tokens = max_output_tokens
         self.retry_truncated = retry_truncated
         self._client = None
+        #: Normalised sentences this translator already produced, most recent
+        #: last. The prompt above tells the model not to repeat the context;
+        #: this is the guarantee for when it does anyway.
+        self._recent_out: deque[str] = deque(maxlen=48)
 
     def _get_client(self):  # pragma: no cover - network path
         if self._client is not None:
@@ -200,12 +225,30 @@ class LlmTranslator(Translator):
         messages = [{"role": "system", "content": self.build_prompt(unit, terms)}]
         history = ctx.render() if ctx is not None else ""
         if history:
+            # The context is fenced on BOTH sides - a labelled message and a
+            # confirming assistant turn - because a bare "for context only"
+            # preamble measurably fails on fragments: handed half a clause
+            # that continues a context sentence, the model completes the
+            # sentence from context, or re-translates the whole context as a
+            # recap. Observed verbatim in a live call: a five-word fragment
+            # came back as the entire last minute of the meeting, re-spoken.
             messages.append(
                 {
                     "role": "user",
                     "content": (
-                        "Earlier in this meeting, for context only - do not "
-                        f"translate this:\n{history}"
+                        "Context - what was ALREADY said and ALREADY spoken "
+                        "aloud earlier in this meeting. Do not translate it, "
+                        "do not repeat it, do not merge it into your "
+                        f"output:\n{history}"
+                    ),
+                }
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "Understood. I will translate only the next message "
+                        "and output none of the context."
                     ),
                 }
             )
@@ -238,7 +281,14 @@ class LlmTranslator(Translator):
 
         out = (resp.choices[0].message.content or "").strip()
 
-        if self.retry_truncated and looks_truncated(text, out):
+        # No retry while the listener is already behind: `prefer_brevity` is
+        # the drift controller saying playback is late, and a completeness
+        # retry is a second full round trip added to exactly the wrong moment.
+        if (
+            self.retry_truncated
+            and not unit.prefer_brevity
+            and looks_truncated(text, out)
+        ):
             # The failure this catches, observed verbatim: five sentences in,
             # one sentence out.
             #     "Hey, welcome back. I'm David. And I'm Alice. Hello,
@@ -272,4 +322,41 @@ class LlmTranslator(Translator):
                 if second and not looks_truncated(text, second):
                     out = second
 
+        out = self._strip_already_spoken(out)
+        for piece in SENTENCE_SPLIT.split(out):
+            if len(piece.split()) >= 4:
+                self._recent_out.append(_norm_sentence(piece))
+
         return TranslatedUnit(text=out, source=unit, at=now())
+
+    def _strip_already_spoken(self, out: str) -> str:
+        """Drop whole sentences that were already produced for earlier units.
+
+        The failure this guards against, observed verbatim in a live call:
+        given rolling context and a garbled five-word fragment, the model
+        returned the entire last minute of the meeting re-translated, with
+        the fragment on the end - and the listener heard the meeting
+        repeated back to them. The prompt now forbids it; this makes the
+        ban mechanical.
+
+        Deliberately narrow, because a speaker genuinely repeating a
+        sentence must survive:
+          * only MULTI-sentence outputs are filtered - a recap has the shape
+            of several sentences, a genuine repetition arrives alone;
+          * only sentences of four words or more are compared - "yes." and
+            "okay?" recur in every meeting and belong to whoever says them.
+        """
+        parts = [p for p in SENTENCE_SPLIT.split(out.strip()) if p.strip()]
+        if len(parts) <= 1:
+            return out
+        kept = [
+            p
+            for p in parts
+            if not (
+                len(p.split()) >= 4
+                and _norm_sentence(p) in self._recent_out
+            )
+        ]
+        if len(kept) == len(parts):
+            return out
+        return " ".join(kept).strip()

@@ -117,6 +117,11 @@ class IncomingPipeline:
         self._audio_in: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=100)
         self._play_q: asyncio.Queue["_PlayItem"] = asyncio.Queue()
         self._units: asyncio.Queue = asyncio.Queue(maxsize=32)
+        #: Units whose translation is already in flight, in speaking order.
+        #: The bound is the lookahead: how many translations may run ahead of
+        #: the mouth. Small on purpose - each one is money and, if the queue
+        #: ever drops units, wasted money.
+        self._ready_q: asyncio.Queue = asyncio.Queue(maxsize=2)
         self._queued_ms = 0.0
         self._stream = None
         self._tasks: list[asyncio.Task] = []
@@ -165,7 +170,8 @@ class IncomingPipeline:
             asyncio.create_task(self._pump_audio(), name="incoming-audio"),
             asyncio.create_task(self._consume_hypotheses(), name="incoming-asr"),
             asyncio.create_task(self._play_loop(), name="incoming-playback"),
-            asyncio.create_task(self._unit_worker(), name="incoming-units"),
+            asyncio.create_task(self._translate_worker(), name="incoming-translate"),
+            asyncio.create_task(self._speak_worker(), name="incoming-speak"),
         ]
 
     def _asr_config(self) -> AsrConfig:
@@ -190,6 +196,12 @@ class IncomingPipeline:
             self._stream = None
         self.segmenter.reset()
         self.gate.reset()
+        while True:
+            try:
+                *_ignored, job = self._ready_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            job.cancel()
         self._drain_playback()
 
     # ------------------------------------------------------------------
@@ -249,9 +261,8 @@ class IncomingPipeline:
 
 
                 if self._stream is not None:
-                    audio_frame = res.audio if res.audio is not None else frame
                     try:
-                        await self._stream.push_audio(audio_frame)
+                        await self._stream.push_audio(frame)
                         last_push = now()
                     except ProviderError:
                         # The consumer owns the connection: it will notice the
@@ -360,39 +371,65 @@ class IncomingPipeline:
             with contextlib.suppress(asyncio.QueueFull):
                 self._units.put_nowait(unit)
 
-    async def _unit_worker(self) -> None:
-        """One unit at a time, in order, off the recognition path."""
+    async def _translate_worker(self) -> None:
+        """Start a unit's translation the moment it is confirmed.
+
+        THE SERIALISATION THIS REPLACES was the pipeline's dominant latency
+        cost in continuous speech. The old worker did, per unit:
+
+            translate -> synthesise -> wait for the first audible block
+
+        one unit at a time, so unit N+1's translation did not START until
+        unit N was already sounding. Each unit therefore paid its
+        predecessor's full network cost on top of its own, the queue grew
+        faster than it drained for as long as the speaker kept talking, and
+        the drift controller's stretch-then-drop was the only thing keeping
+        the lag finite.
+
+        Translation is network-bound and does not touch the sink, so it does
+        not need to be serialised with playback at all - only SPEAKING has to
+        happen in order. This stage launches translations as units arrive
+        (`_ready_q`'s bound is the lookahead) and hands them, still in
+        order, to `_speak_worker`. While one unit is being synthesised and
+        spoken, the next one or two are already in flight at the translator.
+        """
         while True:
             unit = await self._units.get()
-            try:
-                await self._translate_and_speak(unit)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # pragma: no cover - must never die
-                if self.on_degrade:
-                    with contextlib.suppress(Exception):
-                        self.on_degrade("impair", f"unit failed: {exc}")
+            trace = self._speaking_trace or self.traces.new(Direction.INCOMING)
+            trace.mark("unit_emitted")
+            trace.words = unit.words
 
-    async def _translate_and_speak(self, unit) -> None:
-        trace = self._speaking_trace or self.traces.new(Direction.INCOMING)
-        trace.mark("unit_emitted")
-        trace.words = unit.words
+            queue_ms = self._queue_ms()
+            decision = self.drift.decide(queue_ms)
+            self.metrics.set_queue_depth(Direction.INCOMING, queue_ms)
+            self.metrics.set_drift(Direction.INCOMING, decision.rate)
 
-        queue_ms = self._queue_ms()
-        decision = self.drift.decide(queue_ms)
-        self.metrics.set_queue_depth(Direction.INCOMING, queue_ms)
-        self.metrics.set_drift(Direction.INCOMING, decision.rate)
+            if decision.drop:
+                # §7.6: dropping always beats growing, and it is never silent.
+                trace.dropped = True
+                trace.drop_reason = (
+                    f"playback is {queue_ms / 1000:.1f} s behind"
+                )
+                self.metrics.record(trace)
+                self._emit_transcript(unit.text, "", dropped=True)
+                continue
 
-        if decision.drop:
-            # §7.6: dropping always beats growing, and it is never silent.
-            trace.dropped = True
-            trace.drop_reason = (
-                f"playback is {queue_ms / 1000:.1f} s behind"
+            # Context carries the SOURCE text, so it can be added before the
+            # translation exists - which is exactly what lets unit N+1's
+            # translation run concurrently and still see unit N in context.
+            self.context.add("client", unit.text)
+            job = asyncio.create_task(
+                self._translate_unit(unit, trace, decision)
             )
-            self.metrics.record(trace)
-            self._emit_transcript(unit.text, "", dropped=True)
-            return
+            # Blocks when the lookahead is full - that is the backpressure
+            # that stops money being spent translating text the drift
+            # controller is about to drop.
+            await self._ready_q.put((unit, trace, decision, job))
 
+    async def _translate_unit(self, unit, trace, decision):
+        """One translation round trip. Never raises: the result is awaited
+        bare by the speech worker, and a unit that failed is a unit skipped,
+        not a pipeline down."""
         tu = TranslationUnit(
             text=unit.text,
             source_language="en",
@@ -401,34 +438,62 @@ class IncomingPipeline:
             prefer_brevity=decision.prefer_brevity,
         )
         try:
-            translated = await self.translator.translate(
+            return await self.translator.translate(
                 tu, self.context, self.terminology
             )
-        except ProviderError as exc:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
             trace.dropped = True
             trace.drop_reason = str(exc)
             self.metrics.record(trace)
             self._emit_transcript(unit.text, "", dropped=True)
-            return
+            return None
 
-        trace.mark("translated")
-        if not translated.text.strip():
-            # The translator was told to emit nothing rather than guess (§8.4.2).
-            self.metrics.record(trace)
-            return
+    async def _speak_worker(self) -> None:
+        """Speak translated units strictly in order, one at a time.
 
-        self.context.add("client", unit.text)
-        self._emit_transcript(unit.text, translated.text)
+        Order lives in `_ready_q`, not in when translations happen to finish:
+        a fast translation of unit N+1 waits here behind a slow unit N.
+        Serialising synthesis is deliberate - two utterances synthesised at
+        once interleave their chunks in the play queue and are heard as two
+        people talking over each other in one voice.
+        """
+        while True:
+            unit, trace, decision, job = await self._ready_q.get()
+            try:
+                translated = await job
+                if translated is None:
+                    continue
 
-        # The transcript keeps the translation as written; only the voice gets
-        # the rewritten version - Latin words said in Urdu, and an ending that
-        # matches whether the speaker actually finished the thought. See
-        # app/providers/urdu_speech.
-        spoken = for_speech(
-            translated.text,
-            final=ends_sentence(unit.text, getattr(unit, "reason", "")),
-        )
-        await self._speak(spoken, trace, decision.rate)
+                trace.mark("translated")
+                if not translated.text.strip():
+                    # Told to emit nothing rather than guess (§8.4.2).
+                    self.metrics.record(trace)
+                    continue
+
+                self._emit_transcript(unit.text, translated.text)
+
+                # The transcript keeps the translation as written; only the
+                # voice gets the rewritten version - Latin words said in Urdu,
+                # and an ending that matches whether the speaker actually
+                # finished the thought. See app/providers/urdu_speech.
+                spoken = for_speech(
+                    translated.text,
+                    final=ends_sentence(unit.text, getattr(unit, "reason", "")),
+                )
+                # The rate is decided NOW, not when the unit was confirmed:
+                # the queue has moved while the translation was in flight,
+                # and a rate measured before it is stale by exactly the
+                # latency this pipeline is trying to hide.
+                rate = self.drift.decide(self._queue_ms()).rate
+                await self._speak(spoken, trace, rate)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - must never die
+                if self.on_degrade:
+                    with contextlib.suppress(Exception):
+                        self.on_degrade("impair", f"unit failed: {exc}")
 
     def _clone_reference(self):
         """The voice to imitate, or None - which is the normal case.

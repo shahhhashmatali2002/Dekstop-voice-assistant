@@ -81,7 +81,15 @@ class PipelineConfig:
     vad_preroll_ms: float = 250.0
     stability_hypotheses: int = 3
     stability_ms: float = 300.0
-    max_words: int = 12
+    #: Where a unit is cut when the speaker never pauses. Ten words is about
+    #: four seconds of speech - the ceiling on how stale a clause can get
+    #: before it is translated anyway. Soft-boundary emission (below) should
+    #: fire well before this in normally punctuated fluent speech.
+    max_words: int = 10
+    #: A stable prefix ending at a comma is emitted once it is this many
+    #: words long. This is the clause-level streaming knob for continuous
+    #: speech: lower is sooner but choppier translation units.
+    soft_min_words: int = 6
     barge_in_confirm_ms: float = 250.0
     suppress_backchannels: bool = True
 
@@ -105,9 +113,16 @@ class PipelineConfig:
     #: genuinely sits three to six seconds behind - so the old numbers would
     #: drop every single unit and play nothing at all. Raised to match what
     #: they now mean.
-    drift_comfortable_ms: float = 2000.0
-    drift_stretch_ms: float = 6000.0
-    drift_aggressive_ms: float = 12000.0
+    #: Retuned for the pipelined unit worker: with translation running ahead
+    #: of synthesis the cascade's honest steady state is roughly one unit's
+    #: processing time (one to two and a half seconds), so the bands start
+    #: where that ends. The old 2/6/12 s bands were sized to a worker that
+    #: serialised translate -> synthesise -> play and genuinely sat three to
+    #: six seconds behind; keeping them now would let the lag grow to twelve
+    #: seconds before anything was dropped.
+    drift_comfortable_ms: float = 1500.0
+    drift_stretch_ms: float = 4000.0
+    drift_aggressive_ms: float = 8000.0
     drift_max_rate: float = 1.12
     original_mix_db: float | None = None
 

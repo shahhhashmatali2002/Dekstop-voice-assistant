@@ -48,6 +48,11 @@ class DeepgramAsrStream(AsrStream):
         self._q: asyncio.Queue[TranscriptDelta | None] = asyncio.Queue(maxsize=128)
         self._reader = asyncio.create_task(self._read_loop())
         self._closed = False
+        #: Why the read loop died, when it died badly. Surfaced through
+        #: `hypotheses()` so the consumer can tell a polite close from a
+        #: NET-0001 - swallowing this (as this class used to) made every
+        #: death look voluntary, and nobody redials after a goodbye.
+        self._failure: Exception | None = None
 
     async def push_audio(self, pcm: np.ndarray) -> None:
         if self._closed:
@@ -128,8 +133,8 @@ class DeepgramAsrStream(AsrStream):
                 )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            self._failure = exc
         finally:
             with contextlib.suppress(Exception):
                 self._q.put_nowait(None)
@@ -148,6 +153,11 @@ class DeepgramAsrStream(AsrStream):
         while True:
             item = await self._q.get()
             if item is None:
+                failure, self._failure = self._failure, None
+                if failure is not None and not self._closed:
+                    if isinstance(failure, ProviderError):
+                        raise failure
+                    raise ProviderUnavailable(str(failure)) from failure
                 return
             yield item
 
@@ -181,7 +191,20 @@ class DeepgramSpeechToText(SpeechToText):
             "interim_results": "true" if cfg.interim_results else "false",
             "punctuate": "true",
             "smart_format": "true",
-            "endpointing": "300",
+            # smart_format holds finalisation back while it waits to see the
+            # whole of an entity it is formatting - a number, a date, a
+            # currency amount - and the documented hold is up to three
+            # seconds. In an offline transcript that is free; in a live
+            # cascade it is three seconds added to exactly the sentences
+            # that contain the figures a client call is about. no_delay
+            # trades the formatting of a partially-heard entity away for
+            # transcripts that arrive when the words were said.
+            "no_delay": "true",
+            # How much silence ends an utterance (speech_final). Tunable
+            # because it trades against the VAD hangover, which fires our own
+            # flush at vad_hangover_ms - the two should stay in the same
+            # region or one of them is dead weight.
+            "endpointing": os.environ.get("DEEPGRAM_ENDPOINTING", "300"),
         }
         query = urlencode(params)
         # Keyterms repeat as separate parameters (§7.7). The cap is Deepgram's

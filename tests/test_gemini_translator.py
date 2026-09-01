@@ -216,3 +216,51 @@ def test_asking_for_realtime_without_a_key_still_gets_the_cascade(monkeypatch):
 
     providers = {"asr": object(), "translator": object(), "tts": object()}
     assert isinstance(build_s2st(providers), CascadeSpeechTranslator)
+
+
+# ======================================================================
+# the repeat guard
+# ======================================================================
+
+
+def _guarded():
+    from app.providers.llm_translator import LlmTranslator
+
+    return LlmTranslator(api_key="test-key")
+
+
+def test_a_recap_of_already_spoken_sentences_is_stripped():
+    """Observed in a live call: handed rolling context and a garbled
+    fragment, the model returned the last minute of the meeting re-translated
+    with the fragment on the end."""
+    from app.providers.llm_translator import _norm_sentence
+
+    t = _guarded()
+    t._recent_out.append(_norm_sentence("My name is Heshmat Ali."))
+    t._recent_out.append(_norm_sentence("And I am from Pakistan."))
+    out = t._strip_already_spoken(
+        "My name is Heshmat Ali. And I am from Pakistan. Kam Sem University"
+    )
+    assert out == "Kam Sem University"
+
+
+def test_a_genuine_single_sentence_repeat_survives():
+    """A speaker repeating themselves must still be voiced - only
+    multi-sentence recaps are filtered."""
+    from app.providers.llm_translator import _norm_sentence
+
+    t = _guarded()
+    t._recent_out.append(_norm_sentence("My name is Heshmat Ali."))
+    kept = t._strip_already_spoken("My name is Heshmat Ali.")
+    assert kept == "My name is Heshmat Ali."
+
+
+def test_short_recurring_sentences_are_never_stripped():
+    """"okay." and "yes." recur in every meeting and belong to whoever
+    says them."""
+    from app.providers.llm_translator import _norm_sentence
+
+    t = _guarded()
+    t._recent_out.append(_norm_sentence("okay."))
+    out = t._strip_already_spoken("Okay. Let us continue with the plan.")
+    assert "Okay." in out
