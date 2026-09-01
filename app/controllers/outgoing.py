@@ -183,11 +183,9 @@ class OutgoingPipeline:
                     print("[DEBUG OUTGOING] Speech OFFSET detected", flush=True)
                     self._notify_speech(False)
 
-                # The realtime translation model requires continuous audio,
-                # INCLUDING the silence between phrases (§8.7). So we always
-                # send something - the real frame when speaking, silence when
-                # not - rather than pausing the feed.
-                payload = res.audio if res.audio is not None else frame * 0
+                # Send the actual audio frame continuously so Deepgram's neural
+                # acoustic model has complete, unchopped phonemes and natural context.
+                payload = frame
                 if self._stream is not None:
                     try:
                         await self._stream.push_audio(payload)

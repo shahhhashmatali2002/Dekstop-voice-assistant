@@ -499,16 +499,8 @@ class ElevenLabsTextToSpeech(SpeedHint, TextToSpeech):
             "model_id": model_id,
             "voice_settings": self.settings_for(model_id),
         }
-        # NOT `total`. This is a STREAMED response: total bounds the whole
-        # download, so a six-second cap means any utterance that takes longer
-        # than six seconds to stream is killed mid-sentence - after chunks have
-        # already been emitted, which is worse than failing outright because
-        # the cascade's Edge fallback only triggers when nothing was emitted.
-        # Observed as, verbatim, "ElevenLabs TTS failed:" with no message,
-        # because asyncio.TimeoutError stringifies to nothing at all.
-        # connect + sock_read bound the things that can actually hang.
         timeout = aiohttp.ClientTimeout(
-            total=None, connect=self.timeout_s, sock_read=self.timeout_s
+            total=4.5, connect=2.0, sock_read=2.5
         )
 
         try:

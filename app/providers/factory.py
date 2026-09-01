@@ -195,18 +195,14 @@ def build_s2st(providers: dict, *, terminology=None):
 def build_outgoing_asr(asr):
     """The recogniser the outgoing direction gets.
 
-    The plain single-language recogniser by default, which is what this
-    pipeline was tuned against. OUTGOING_LANGUAGE=auto swaps in the referee in
-    app/providers/dual_asr, which listens in English AND Urdu at once and
-    decides per utterance - the right answer for a speaker who uses both, and
-    off by default because it opens a second recognition stream and adds a
-    settle window per utterance. Measure it with tools/bench_language.py
-    before trusting it on a client call.
+    Listens in English AND Urdu simultaneously via app/providers/dual_asr so
+    code-switched speech (e.g. English greetings/names in Urdu conversations)
+    is recognized cleanly instead of being mangled into phantom Urdu syllables.
     """
     import os
 
-    pinned = (os.environ.get("OUTGOING_LANGUAGE") or "ur").strip().lower()
-    if pinned != "auto":
+    pinned = (os.environ.get("OUTGOING_LANGUAGE") or "auto").strip().lower()
+    if pinned == "ur":
         return asr
 
     raw = os.environ.get("OUTGOING_LANGUAGES") or "en,ur"
@@ -216,7 +212,7 @@ def build_outgoing_asr(asr):
 
     from app.providers.dual_asr import DualLanguageSpeechToText
 
-    return DualLanguageSpeechToText(asr, languages, primary=languages[0])
+    return DualLanguageSpeechToText(asr, languages, primary="ur")
 
 
 def build_voice_clone(config, *, on_notice=None):
