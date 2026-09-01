@@ -185,8 +185,38 @@ def build_s2st(providers: dict, *, terminology=None):
         tts = ElevenLabsTextToSpeech(eleven_key)
 
     return CascadeSpeechTranslator(
-        providers["asr"], providers["translator"], tts, terminology=terminology
+        build_outgoing_asr(providers["asr"]),
+        providers["translator"],
+        tts,
+        terminology=terminology,
     )
+
+
+def build_outgoing_asr(asr):
+    """The recogniser the outgoing direction gets.
+
+    The plain single-language recogniser by default, which is what this
+    pipeline was tuned against. OUTGOING_LANGUAGE=auto swaps in the referee in
+    app/providers/dual_asr, which listens in English AND Urdu at once and
+    decides per utterance - the right answer for a speaker who uses both, and
+    off by default because it opens a second recognition stream and adds a
+    settle window per utterance. Measure it with tools/bench_language.py
+    before trusting it on a client call.
+    """
+    import os
+
+    pinned = (os.environ.get("OUTGOING_LANGUAGE") or "ur").strip().lower()
+    if pinned != "auto":
+        return asr
+
+    raw = os.environ.get("OUTGOING_LANGUAGES") or "en,ur"
+    languages = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if len(languages) < 2:
+        return asr
+
+    from app.providers.dual_asr import DualLanguageSpeechToText
+
+    return DualLanguageSpeechToText(asr, languages, primary=languages[0])
 
 
 def build_voice_clone(config, *, on_notice=None):

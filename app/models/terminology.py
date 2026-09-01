@@ -37,6 +37,26 @@ DEFAULT_LOCKED = [
 ]
 
 
+#: Locked for TRANSLATION, useless as a recogniser hint. Keyterm prompting
+#: biases the model towards a word; biasing it towards words it already knows
+#: and that are common in ordinary speech buys nothing and costs two things -
+#: budget (the cap is counted in tokens across the whole request, and these
+#: were filling it ahead of the names that actually get mangled) and
+#: precision, because a model pushed towards "job" will hear "job" in "jab".
+#:
+#: They stay in `locked`, where they belong: the point of "production" being
+#: locked is that the TRANSLATOR must not render it as something else.
+NOT_WORTH_HINTING = {
+    "deploy", "deployment", "staging", "production", "sprint", "backlog",
+    "ticket", "branch", "commit", "build", "release", "scope", "software",
+    "job", "developer", "engineer", "remote", "freelance", "office",
+    "manager", "project", "client", "meeting", "company", "database",
+    "schema", "migration", "frontend", "backend", "pipeline", "endpoint",
+    "repository", "repo", "integration", "requirement", "milestone",
+    "go live", "standup", "retro", "rollback",
+}
+
+
 @dataclass
 class Terminology:
     """Terms that must not be translated, entities, and forced renderings."""
@@ -94,9 +114,15 @@ class Terminology:
         seen: set[str] = set()
         for term in [*self.entities, *self.preferred.keys(), *self.locked]:
             k = term.lower()
-            if k not in seen:
-                seen.add(k)
-                out.append(term)
+            if k in seen:
+                continue
+            seen.add(k)
+            # Entities are always worth a hint - a name is exactly what
+            # keyterm prompting is for. Generic vocabulary is not, however
+            # firmly it is locked against translation.
+            if k in NOT_WORTH_HINTING and term not in self.entities:
+                continue
+            out.append(term)
             if len(out) >= limit:
                 break
         return out

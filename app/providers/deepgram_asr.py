@@ -36,10 +36,15 @@ from app.providers.base import (
 ENDPOINT = "wss://api.deepgram.com/v1/listen"
 DEFAULT_MODEL = "nova-3"
 
+#: Deepgram counts keyterm prompting in tokens across the whole request, not
+#: in list entries. Documented limit is 500; stay under it.
+KEYTERM_TOKEN_BUDGET = 460
+
 
 class DeepgramAsrStream(AsrStream):
-    def __init__(self, ws) -> None:
+    def __init__(self, ws, language: str = "") -> None:
         self._ws = ws
+        self._language = language
         self._q: asyncio.Queue[TranscriptDelta | None] = asyncio.Queue(maxsize=128)
         self._reader = asyncio.create_task(self._read_loop())
         self._closed = False
@@ -103,11 +108,22 @@ class DeepgramAsrStream(AsrStream):
                 if words and "speaker" in words[0]:
                     speaker = f"speaker {words[0]['speaker']}"
 
+                # Confidence is what lets two recognisers listening to the
+                # same microphone be compared (see dual_asr). Deepgram reports
+                # it per alternative; on an interim it is often absent.
+                confidence = alts[0].get("confidence")
+                try:
+                    confidence = float(confidence) if confidence is not None else None
+                except (TypeError, ValueError):
+                    confidence = None
+
                 await self._put(
                     TranscriptDelta(
                         text=text,
                         is_final=bool(msg.get("is_final") or msg.get("speech_final")),
                         speaker=speaker,
+                        language=self._language or None,
+                        confidence=confidence,
                     )
                 )
         except asyncio.CancelledError:
@@ -168,8 +184,33 @@ class DeepgramSpeechToText(SpeechToText):
             "endpointing": "300",
         }
         query = urlencode(params)
-        # Keyterms repeat as separate parameters (§7.7).
-        for term in cfg.keyterms[:100]:
+        # Keyterms repeat as separate parameters (§7.7). The cap is Deepgram's
+        # and it is counted in TOKENS across the whole list - 500 - not in
+        # entries, so a hundred multi-word phrases silently overruns it and
+        # the request is rejected or the tail is ignored. Budget in words, and
+        # spend it on the front of the list, which terminology.keyterms()
+        # already orders by how much a mis-hearing would cost.
+        # MEASURED, not assumed: on this project's own Urdu audio, keyterm
+        # prompting made recognition WORSE, and specifically worse on the
+        # thing it was added to protect -
+        #
+        #   without keyterms   ... مائیکروسافٹ پاکستان   (Microsoft Pakistan)
+        #   with keyterms      ... مائکرو صاحب پاکستان   ("micro sahib")
+        #
+        # An English keyterm list biases an Urdu model towards Urdu spellings
+        # of English words that it was already getting right, and the nearest
+        # Urdu word to a hint it half-matches can be worse than its own first
+        # answer. So hints go to English only unless explicitly forced.
+        latin = cfg.language.split("-")[0].lower() in ("en", "multi")
+        forced = (os.environ.get("KEYTERMS_ALL_LANGUAGES") or "").lower() in (
+            "1", "true", "yes", "on",
+        )
+        spent = 0
+        for term in (cfg.keyterms if (latin or forced) else []):
+            cost = len(term.split()) + 1
+            if spent + cost > KEYTERM_TOKEN_BUDGET:
+                break
+            spent += cost
             query += "&" + urlencode({"keyterm": term})
         return f"{ENDPOINT}?{query}"
 
@@ -187,4 +228,4 @@ class DeepgramSpeechToText(SpeechToText):
             )
         except Exception as exc:
             raise ProviderUnavailable(f"could not open ASR stream: {exc}") from exc
-        return DeepgramAsrStream(ws)
+        return DeepgramAsrStream(ws, language=cfg.language)

@@ -65,18 +65,26 @@ ELEVENLABS_DEFAULT_VOICE = "pNInz6obpgDQGcFmaJgB"  # Adam
 
 
 def english_voice(rate: int, tts_vendor: str = "") -> VoiceId:
-    if tts_vendor.startswith("eleven"):
+    if tts_vendor.startswith("eleven") or tts_vendor.startswith("fallback"):
         name = (
-            os.environ.get("ELEVENLABS_VOICE_ID")
+            os.environ.get("ELEVEN_EN_VOICE_ID")
+            or os.environ.get("ELEVENLABS_VOICE_ID")
             or os.environ.get("ENGLISH_VOICE")
+            # The known-working default, restored. Resolving a voice from the
+            # account instead meant a network round trip inside the first
+            # utterance of every call, which is latency in the one place this
+            # pipeline cannot afford it.
             or ELEVENLABS_DEFAULT_VOICE
         )
-        return VoiceId(vendor="elevenlabs", name=name, rate=rate)
+        return VoiceId(vendor="elevenlabs", name=name, rate=rate, language="en")
     name = os.environ.get("ENGLISH_VOICE") or DEFAULT_ENGLISH_VOICE
     return VoiceId(
         vendor="edge",
         name=name,
         rate=rate,
+        # Without this the English the client hears goes through the Urdu text
+        # preparation and arrives as Urdu script inside an English voice.
+        language="en",
     )
 
 
@@ -109,6 +117,7 @@ class CascadeS2stStream(S2stStream):
         self._speaking = asyncio.Lock()
         self._jobs: set[asyncio.Task] = set()
         self._last_push = 0.0
+        self._pushed_ms = 0.0
         self._worker = asyncio.create_task(self._read_hypotheses())
         self._heartbeat = asyncio.create_task(self._keep_alive())
 
@@ -122,6 +131,7 @@ class CascadeS2stStream(S2stStream):
         if self._cfg.rate != RATE_ASR:
             pcm = convert.resample(pcm, self._cfg.rate, RATE_ASR)
         self._last_push = time.monotonic()
+        self._pushed_ms += len(pcm) * 1000.0 / RATE_ASR
         await self._asr.push_audio(pcm)
 
     #: Deepgram drops a stream after ten seconds with nothing on it. Half that
@@ -181,10 +191,49 @@ class CascadeS2stStream(S2stStream):
 
     # ---------------------------------------------------------------- pumps
 
+    #: Recogniser accounting, printed every ten seconds. The question this
+    #: answers is the one the ONSET/OFFSET log could not: when eleven speech
+    #: events produce one transcript, is the recogniser being sent nothing, or
+    #: being sent audio and returning nothing? Those have opposite fixes and
+    #: look identical from outside.
+    REPORT_EVERY_S = 10.0
+
     async def _read_hypotheses(self) -> None:
+        import os
+
+        verbose = (os.environ.get("DEBUG_ASR") or "").lower() in ("1", "true", "on")
+        interims = finals = 0
+        last_report = time.monotonic()
         try:
             async for hypothesis in self._asr.hypotheses():
                 text = (hypothesis.text or "").strip()
+
+                if hypothesis.is_final:
+                    finals += 1
+                elif text:
+                    interims += 1
+                if verbose and text:
+                    kind = "FINAL" if hypothesis.is_final else "interim"
+                    print(
+                        f"[DEBUG ASR] {kind:<7} "
+                        f"conf={hypothesis.confidence if hypothesis.confidence is not None else '-'} "
+                        f"{text[:90]}",
+                        flush=True,
+                    )
+                if time.monotonic() - last_report >= self.REPORT_EVERY_S:
+                    print(
+                        f"[DEBUG ASR] last {time.monotonic() - last_report:.0f}s: "
+                        f"{self._pushed_ms / 1000:.1f}s of audio sent, "
+                        f"{interims} interim and {finals} final results back"
+                        + ("" if interims or finals else
+                           "  <-- audio is going out and NOTHING is coming "
+                           "back: check the language setting, not the mic"),
+                        flush=True,
+                    )
+                    interims = finals = 0
+                    self._pushed_ms = 0.0
+                    last_report = time.monotonic()
+
                 if not text:
                     continue
 
@@ -199,7 +248,9 @@ class CascadeS2stStream(S2stStream):
                 if not hypothesis.is_final:
                     continue
 
-                job = asyncio.create_task(self._speak_translation(text))
+                job = asyncio.create_task(
+                    self._speak_translation(text, hypothesis.language)
+                )
                 self._jobs.add(job)
                 job.add_done_callback(self._jobs.discard)
         except asyncio.CancelledError:
@@ -222,31 +273,54 @@ class CascadeS2stStream(S2stStream):
             with contextlib.suppress(Exception):
                 self._text.put_nowait(None)
 
-    async def _speak_translation(self, said: str) -> None:
-        """Translate one finished utterance and synthesise it, in order."""
+    async def _speak_translation(
+        self, said: str, heard_language: str | None = None
+    ) -> None:
+        """Translate one finished utterance and synthesise it, in order.
+
+        `heard_language` is what the recogniser decided it was listening to.
+        When that is already the language the client hears, the translator is
+        SKIPPED entirely, and that is a correctness fix rather than an
+        optimisation. Asked to render English into English, a language model
+        does not copy - it edits, and the thing it edits most readily is the
+        token it half-recognises: "Macrosoft" becomes "Microsoft", because
+        "Microsoft" is what the training data says a person meant. A speaker
+        introducing their own employer is then contradicted, fluently, in
+        their own voice. Nothing said in the target language is worth a round
+        trip through a model that is free to disagree with it.
+        """
         async with self._speaking:
             if self._closed:
                 return
-            unit = TranslationUnit(
-                text=said,
-                source_language=self._cfg.source_language or "ur",
-                target_language=self._cfg.target_language,
-            )
-            try:
-                translated = await self._translator.translate(
-                    unit, self._context, self._terminology
-                )
-            except ProviderError as exc:
-                self.failure = exc
-                with contextlib.suppress(Exception):
-                    self._audio.put_nowait(None)
-                return
-            except Exception:
-                return
 
-            english = (translated.text or "").strip()
-            if not english:
-                return
+            target = self._cfg.target_language
+            source = (heard_language or self._cfg.source_language or "ur").strip()
+
+            if source.split("-")[0] == target.split("-")[0]:
+                english = said.strip()
+                if not english:
+                    return
+            else:
+                unit = TranslationUnit(
+                    text=said,
+                    source_language=source,
+                    target_language=target,
+                )
+                try:
+                    translated = await self._translator.translate(
+                        unit, self._context, self._terminology
+                    )
+                except ProviderError as exc:
+                    self.failure = exc
+                    with contextlib.suppress(Exception):
+                        self._audio.put_nowait(None)
+                    return
+                except Exception:
+                    return
+
+                english = (translated.text or "").strip()
+                if not english:
+                    return
 
             self._context.add("you", english)
             # Both halves, together: this path heard the Urdu and produced
@@ -268,7 +342,13 @@ class CascadeS2stStream(S2stStream):
                     synthesized_any = True
                     await self._put(self._audio, chunk)
             except Exception as exc:
-                if vendor.startswith("eleven") and not synthesized_any:
+                # `not synthesized_any` used to gate this, on the reasoning
+                # that half a sentence in one voice and half in another is
+                # worse than either. It is not worse than the client hearing
+                # the first two words and then nothing, which is what a
+                # mid-stream failure actually produced. Speaking the whole
+                # line again in the free voice is the least bad of the three.
+                if vendor.startswith("eleven"):
                     try:
                         from app.providers.tts import EdgeTextToSpeech
                         fallback_tts = EdgeTextToSpeech()

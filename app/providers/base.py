@@ -75,6 +75,10 @@ class TranscriptDelta:
     speaker: str | None = None
     at: float = field(default_factory=now)
     source_text: str | None = None
+    #: The recogniser's own confidence in this hypothesis, 0..1, when it
+    #: reports one. Two recognisers listening to the same audio can only be
+    #: compared on a number both of them produce - see dual_asr.
+    confidence: float | None = None
 
 
 @dataclass
@@ -102,6 +106,13 @@ class VoiceId:
     name: str  # e.g. "ur-PK-UzmaNeural"
     rate: int = 24_000
     style: str | None = None
+    #: What this voice is about to SPEAK, not where it is from. The text
+    #: preparation in app/providers/urdu_speech is right for Urdu and actively
+    #: destructive for English - it rewrites "I am a developer" as
+    #: "آئی am اے ڈیولپر" - so the synthesiser has to be told which one it is
+    #: holding. Defaults to Urdu because that was the only direction that had
+    #: a voice when this field did not exist.
+    language: str = "ur"
 
 
 @dataclass

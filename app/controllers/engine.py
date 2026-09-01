@@ -27,6 +27,8 @@ import time
 import threading
 from dataclasses import dataclass
 
+import os
+
 import numpy as np
 
 from app.audio import convert
@@ -38,7 +40,7 @@ from app.audio.routing import DefaultOutputRouter, RoutingUnavailable
 from app.controllers.outgoing import BargeInHandler, OutgoingPipeline
 from app.controllers.vad import VoiceActivityGate
 from app.providers.base import VoiceId
-from app.models.telemetry import Direction, MetricsBus, TraceFactory
+from app.models.telemetry import Direction, MetricsBus, TraceFactory, now
 from app.models.config import Config
 from app.models.state import ModeMachine
 from app.models.terminology import Terminology
@@ -280,6 +282,7 @@ class Engine:
             vendor=self.config.providers.tts,
             name=self.config.providers.urdu_voice,
             rate=RATE_S2ST,
+            language="ur",
         )
 
         converter, learner = build_voice_clone(
@@ -408,8 +411,32 @@ class Engine:
                     # which is exactly what a speakerphone does and for the
                     # same reason. The ring is still drained, so nothing piles
                     # up to be sent late.
-                    if raw.size and self._muted_by_playback():
-                        raw = raw[:0]
+                    self._watch_microphone(raw.size, mic)
+                    muted = raw.size and self._muted_by_playback()
+                    if muted:
+                        # HALF DUPLEX, and the two bugs that were hiding here.
+                        #
+                        # ONE: this used to do `raw = raw[:0]` and then skip
+                        # feed() entirely, so the recogniser received NOTHING -
+                        # not silence, nothing. Deepgram drops a stream that has
+                        # had neither audio nor a text frame for ten seconds
+                        # (NET-0001), and every drop loses whatever utterance was
+                        # in flight and costs a reconnect. Silence of the same
+                        # length keeps the stream alive and keeps the VAD's sense
+                        # of time honest, at no cost: silence is what the
+                        # recogniser would have been sent anyway.
+                        #
+                        # TWO, and this is the one that mangles names: the gate
+                        # is open whenever Urdu is audible, which in a real
+                        # conversation is exactly when the user starts replying.
+                        # The FRONT of their sentence is what gets discarded -
+                        # and the front of the sentence is where "I am John
+                        # Wick" and "I work at Macrosoft" begin. A recogniser
+                        # handed "...crosoft" answers "Microsoft", confidently.
+                        # So how much is being thrown away is now measured and
+                        # said out loud rather than left to be guessed at.
+                        self._muted_samples += int(raw.size / max(1, mic.channels))
+                        raw = np.zeros_like(raw)
                     if raw.size:
                         self._outgoing.feed(
                             convert.endpoint_to_pipeline(
@@ -431,6 +458,7 @@ class Engine:
 
                 self._publish_audio_health()
                 self._watch_for_silence()
+                self._report_muted()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - must never die
@@ -510,11 +538,118 @@ class Engine:
         self._said_why = True
 
     def _muted_by_playback(self) -> bool:
-        """Should the microphone be ignored because we are speaking?"""
+        """Should the microphone be ignored because we are speaking?
+
+        HALF_DUPLEX=0 in the environment turns this off without editing
+        settings.json, which is what you want when the question being asked is
+        "is half duplex eating my sentences?" - on headphones there is no
+        acoustic path from the earpiece to the microphone, so there is nothing
+        for it to protect against and everything for it to cost.
+
+        Note what this does NOT check: which output device is in use. The
+        setting's own documentation claims it is "harmless on headphones, where
+        it never triggers". That was never true - it triggers on any output,
+        because all it looks at is whether Urdu is currently audible.
+        """
+        if os.environ.get("HALF_DUPLEX", "").strip() in ("0", "off", "false"):
+            return False
         if not getattr(self.config.devices, "half_duplex", True):
             return False
         pipe = self._incoming
         return bool(pipe is not None and getattr(pipe, "is_speaking", False))
+
+    #: Microphone watchdog state. See _watch_microphone.
+    _mic_last_audio_at = 0.0
+    _mic_gap_reported = False
+    _mic_fed_samples = 0
+
+    def _watch_microphone(self, got: int, mic) -> None:
+        """Say when the microphone stops delivering, because nothing else does.
+
+        THE FAILURE THIS MAKES VISIBLE
+        ------------------------------
+        The outgoing pump only calls feed() when the microphone ring has
+        something in it. If the ring goes empty - the capture stream died, the
+        device was taken by another application, the routing moved underneath
+        it, or "Microphone" was resolved to a silent virtual cable - then
+        nothing is fed, nothing is pushed, and about ten seconds later Deepgram
+        closes the stream with NET-0001 because it has received neither audio
+        nor a keepalive.
+
+        Read from the outside, that looks exactly like a recogniser that cannot
+        understand you: some words get through, then a stream drop takes the
+        utterance that was in flight, then the next few words land on a fresh
+        stream with no context. It is not a recognition problem at all, and
+        until this printed there was no way to tell the two apart.
+
+        `_watch_for_silence` does not cover this: it watches the INCOMING
+        pipeline only, waits sixty seconds, and reports into a bubble rather
+        than the console.
+        """
+        if got:
+            self._mic_fed_samples += int(got / max(1, getattr(mic, "channels", 1)))
+            if self._mic_gap_reported:
+                gap = now() - self._mic_last_audio_at
+                print(
+                    f"[DEBUG OUTGOING] microphone recovered after {gap:.1f}s",
+                    flush=True,
+                )
+                self._mic_gap_reported = False
+            self._mic_last_audio_at = now()
+            return
+
+        if not self._mic_last_audio_at:
+            self._mic_last_audio_at = now()
+            return
+        if self._mic_gap_reported:
+            return
+        gap = now() - self._mic_last_audio_at
+        if gap < 3.0:
+            return
+        self._mic_gap_reported = True
+        rate = getattr(mic, "rate", 0) or 48_000
+        name = getattr(getattr(mic, "device", None), "name", "?")
+        print(
+            f"[DEBUG OUTGOING] microphone {name!r} has delivered NO audio for "
+            f"{gap:.1f}s (total fed this session: "
+            f"{self._mic_fed_samples / rate:.1f}s). The recogniser is being "
+            f"starved - this is what produces NET-0001, not a recognition "
+            f"fault. Check that this is the right device and that nothing else "
+            f"holds it.",
+            flush=True,
+        )
+
+    #: How much microphone audio half duplex has thrown away, and when it was
+    #: last reported. Reported rather than merely counted: a gate that silently
+    #: discards the user's speech is indistinguishable, from the outside, from
+    #: a recogniser that cannot hear.
+    _muted_samples = 0
+    _muted_reported_at = 0.0
+
+    def _report_muted(self) -> None:
+        if not self._muted_samples:
+            return
+        mic = self.ports.mic_source
+        rate = getattr(mic, "rate", 0) or 48_000
+        if not self._muted_reported_at:
+            # First discard of the session: start the clock, do not report an
+            # interval measured from the epoch.
+            self._muted_reported_at = now()
+            return
+        elapsed = now() - self._muted_reported_at
+        if elapsed < 10.0:
+            return
+        seconds = self._muted_samples / rate
+        self._muted_samples = 0
+        self._muted_reported_at = now()
+        if seconds < 0.2:
+            return
+        print(
+            f"[DEBUG OUTGOING] half duplex discarded {seconds:.1f}s of "
+            f"microphone audio in the last {elapsed:.0f}s - if you are on "
+            f"headphones, run with HALF_DUPLEX=0",
+            flush=True,
+        )
 
     def _publish_audio_health(self) -> None:
         for name, obj in (

@@ -207,6 +207,24 @@ class Application:
         if None in required or teams_lb is None or problems:
             return None, problems
 
+        # WHICH DEVICE IS WHICH, said out loud, on the console.
+        #
+        # Every symptom of a mis-assigned device looks like a broken
+        # recogniser: if "Microphone" resolves to a virtual cable, the outgoing
+        # direction is listening to the cable - silent except when our own
+        # English is being rendered into it - and no amount of model tuning
+        # will help. This was previously only visible in a bubble notice, and
+        # only for the incoming direction, and only after sixty seconds.
+        print("  audio devices in use:", flush=True)
+        for role, dev in (
+            ("microphone (you)", mic_dev),
+            ("translator mic (to Teams)", vmic_dev),
+            ("Teams speaker (them)", teams_dev),
+            ("headphones (you hear)", phones_dev),
+        ):
+            name = getattr(dev, "name", None)
+            print(f"    {role:<28} {name if name else '(none)'}", flush=True)
+
         phones = RenderSink(dm, phones_dev)
         teams = CaptureSource(dm, teams_lb)
         mic = None if video else CaptureSource(dm, mic_dev)

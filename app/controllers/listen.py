@@ -528,6 +528,7 @@ class ListenEngine:
             vendor=self.config.providers.tts,
             name=self.config.providers.urdu_voice,
             rate=RATE_S2ST,
+            language="ur",
         )
         converter, learner = build_voice_clone(
             self.config,

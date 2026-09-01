@@ -7,13 +7,13 @@ by ear rather than by spec sheet:
 
   * Azure Neural TTS  - ur-PK-UzmaNeural (female), ur-PK-AsadNeural (male).
     Correct locale for a Pakistani listener.
-  * ElevenLabs Flash v2.5 - ~75 ms model latency, 32 languages, and NOT one of
-    them is Urdu. Checked against their language support page in August 2026:
-    Urdu appears only in Eleven v3, and Professional Voice Cloning is aligned
-    to Flash v2.5's list, so a cloned Urdu voice is not available there either.
-    The implementation stays because the latency is worth having the moment
-    that changes, and because it is the right shape for any other target
-    language - but it must not be presented as an Urdu option today.
+  * ElevenLabs - Flash v2.5 is ~75 ms to first byte across 32 languages, and
+    NOT one of them is Urdu; Urdu lives in the v3 family, which is slower
+    (~280 ms) and more expressive. So the model is chosen from the language
+    rather than pinned - see ELEVEN_MODELS - and Flash keeps the outgoing
+    English direction, where time to first byte is the whole game, while Urdu
+    goes to v3. Professional Voice Cloning is aligned to Flash v2.5's list, so
+    a cloned Urdu voice is still not available.
 
 WHAT MATTERS HERE IS TIME TO FIRST CHUNK, NOT TOTAL TIME
 --------------------------------------------------------
@@ -24,6 +24,7 @@ first 200 ms of audio beats one that takes 250 ms to produce all of it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from typing import AsyncIterator
 
@@ -40,6 +41,17 @@ from app.providers.base import (
     VoiceId,
 )
 
+#: xml:lang for the SSML wrapper. Handing an English sentence to a voice
+#: inside xml:lang="ur-PK" is another way to get an accent nobody asked for.
+LOCALES = {"ur": "ur-PK", "en": "en-US"}
+
+#: Free fallbacks, one per direction. The Urdu one is what shipped; the
+#: English one exists because Edge is now also the safety net UNDER
+#: ElevenLabs for the outgoing direction, and defaulting that to a Pakistani
+#: Urdu voice reading English is exactly the accent complaint.
+DEFAULT_URDU_EDGE_VOICE = "ur-PK-UzmaNeural"
+DEFAULT_ENGLISH_EDGE_VOICE = "en-US-BrianNeural"
+
 # Verified during specification (§8.3).
 AZURE_URDU_VOICES = (
     "ur-PK-UzmaNeural",
@@ -49,7 +61,13 @@ AZURE_URDU_VOICES = (
 )
 
 
-def speakable(text: str, *, final: bool = True) -> str:
+#: Latin-script endings, for text that is going to be read in a Latin-script
+#: language. The Urdu equivalents live in app/providers/urdu_speech.
+_LATIN_TERMINAL = ".!?\u2026"
+_LATIN_CONTINUATION = ",;:"
+
+
+def speakable(text: str, *, final: bool = True, language: str = "ur") -> str:
     """Tidy a line so a neural voice reads it as speech.
 
     Three things matter to how fluent the result sounds, and none of them is
@@ -59,21 +77,48 @@ def speakable(text: str, *, final: bool = True) -> str:
     speech engine: a stray quote or bracket becomes a pause in the middle of
     a phrase.
 
-    An English word left in Latin script inside an Urdu sentence is a word the
-    voice has to guess at, and it guesses badly. `pronounceable` says the ones
-    we know the way an Urdu speaker says them - see app/providers/urdu_speech.
+    An English word left in Latin script inside an URDU sentence is a word the
+    Urdu voice has to guess at, and it guesses badly. `pronounceable` says the
+    ones we know the way an Urdu speaker says them - see
+    app/providers/urdu_speech.
 
     And a clause needs an ending, because a fragment with no final mark is read
-    flat. Which ending depends on whether the thought is finished: "۔" makes
-    the voice fall and stop, so putting one after every clause of a sentence is
-    the robotic reading described in urdu_speech. `final` should be false unless
-    the utterance really ended.
+    flat. Which ending depends on whether the thought is finished: the Urdu
+    full stop makes the voice fall and stop, so putting one after every clause
+    of a sentence is the robotic reading described in urdu_speech. `final`
+    should be false unless the utterance really ended.
+
+    `language` IS NOT OPTIONAL DECORATION
+    -------------------------------------
+    This function used to apply the Urdu preparation to everything it was
+    given, including the English the client hears on the outgoing direction.
+    That is not a cosmetic mistake. `pronounceable` rewrites a word it knows
+    into Urdu script, so a good English sentence reached the English voice as
+
+        "I work at Macrosoft and I am a developer using the API"
+
+    turned into a line where "I", "a", "developer" and "API" had all been
+    replaced by Urdu spellings. An English voice handed Urdu script does what
+    any voice does with letters it cannot read - it approximates, or spells,
+    or skips - and four wrong words in a fourteen-word sentence is heard,
+    correctly, as the accent being bad. The Urdu preparation now runs only for
+    Urdu.
     """
     clean = " ".join((text or "").split())
     if not clean:
         return ""
     clean = clean.strip("\"'\u201c\u201d\u2018\u2019()[]")
-    return close(pronounceable(clean), final=final)
+    if not clean:
+        return ""
+
+    if (language or "ur").lower().startswith("ur"):
+        return close(pronounceable(clean), final=final)
+
+    # Latin-script languages: the same "give the clause an ending" rule, in
+    # the punctuation the voice was actually trained on.
+    if clean[-1] in _LATIN_TERMINAL or clean[-1] in _LATIN_CONTINUATION:
+        return clean
+    return clean + ("." if final else ",")
 
 
 def _xml_escape(s: str) -> str:
@@ -210,7 +255,14 @@ class AzureTextToSpeech(SpeedHint, TextToSpeech):
             "X-Microsoft-OutputFormat": self._output_format,
             "User-Agent": "voice-assistant",
         }
-        body = build_ssml(speakable(text), voice, rate=self._speed).encode(
+        language = (voice.language or "ur").lower()
+        locale = LOCALES.get(language.split("-")[0], "ur-PK")
+        body = build_ssml(
+            speakable(text, language=language),
+            voice,
+            locale=locale,
+            rate=self._speed,
+        ).encode(
             "utf-8"
         )
         timeout = aiohttp.ClientTimeout(total=self.timeout_s)
@@ -247,22 +299,176 @@ class AzureTextToSpeech(SpeedHint, TextToSpeech):
 # ----------------------------------------------------------------------
 
 
+#: Which ElevenLabs model can actually speak which language. This is not a
+#: quality preference, it is a capability table, and getting it wrong is
+#: silent: Flash v2.5 covers 32 languages and Urdu is not one of them, so
+#: Urdu sent to Flash comes back as an English voice sounding out Urdu script.
+#: Urdu lives in the v3 family. English stays on Flash, where ~75 ms to first
+#: byte is worth more than expressiveness on a business call.
+ELEVEN_MODELS = {
+    "ur": os.environ.get("ELEVEN_URDU_MODEL") or "eleven_v3",
+    "en": os.environ.get("ELEVEN_ENGLISH_MODEL") or "eleven_flash_v2_5",
+}
+ELEVEN_FALLBACK_MODEL = "eleven_multilingual_v2"
+
+#: v3 rejects a free-floating stability; it takes one of three settings.
+V3_STABILITY = (0.0, 0.5, 1.0)
+
+#: Words in a voice's own labels and description that mean it will not sound
+#: like a foreigner reading Urdu. Accent is the whole complaint here: any
+#: ElevenLabs voice CAN pronounce Urdu under v3, and a Midwestern American
+#: voice doing it is precisely what "not natural" means.
+SOUTH_ASIAN_HINTS = (
+    "urdu", "pakistan", "pakistani", "hindi", "india", "indian",
+    "south asian", "desi", "punjabi",
+)
+
+
+def _is_elevenlabs_id(name: str) -> bool:
+    """Does this look like a voice ID rather than a platform voice name?
+
+    ElevenLabs IDs are opaque 20-ish character alphanumerics. Azure and Edge
+    names are locale-prefixed and contain hyphens: "ur-PK-UzmaNeural". The
+    config file holds one of those by default, and handing it to ElevenLabs as
+    a voice ID is a 404 at the worst possible moment.
+    """
+    name = (name or "").strip()
+    return bool(name) and name.isalnum() and 15 <= len(name) <= 40
+
+
 class ElevenLabsTextToSpeech(SpeedHint, TextToSpeech):
-    """ElevenLabs streaming synthesis. Flash v2.5 for the latency profile."""
+    """ElevenLabs streaming synthesis, told which language it is speaking.
+
+    Three things this does that the first version did not, all of them
+    audible:
+
+      * picks the MODEL from the language, because Urdu is not in Flash v2.5
+      * picks the VOICE from the account when it was handed an Azure/Edge
+        name, and prefers one whose own labels say it is South Asian
+      * prepares the text for the language it is about to be read in, rather
+        than transliterating English into Urdu script (see `speakable`)
+    """
 
     name = "elevenlabs"
 
     def __init__(
         self,
         api_key: str | None = None,
-        model: str = "eleven_flash_v2_5",
+        model: str | None = None,
         rate: int = 24_000,
         timeout_s: float = 6.0,
     ) -> None:
         self.api_key = api_key or os.environ.get("ELEVENLABS_API_KEY", "")
+        #: An explicit model overrides the capability table, for testing a
+        #: new model without a code change. Normally None.
         self.model = model
         self.rate = rate
         self.timeout_s = timeout_s
+        self._discovered: dict[str, str] = {}
+
+    # ------------------------------------------------------------------
+
+    def model_for(self, language: str) -> str:
+        if self.model:
+            return self.model
+        return ELEVEN_MODELS.get(
+            (language or "en").split("-")[0].lower(), ELEVEN_FALLBACK_MODEL
+        )
+
+    def settings_for(self, model_id: str) -> dict:
+        """Voice settings the chosen model will actually accept.
+
+        Deliberately the settings that were already working, not better ones.
+        Every extra field here is a field the endpoint can reject with a 422,
+        and a 422 is the client hearing silence - so `style` and
+        `use_speaker_boost` are NOT sent on a guess. The only difference from
+        the original is v3, which takes one of three fixed stabilities rather
+        than a continuous value and has no speed control.
+        """
+        if "_v3" in model_id:
+            return {
+                "stability": min(V3_STABILITY, key=lambda v: abs(v - 0.5)),
+                "similarity_boost": 0.75,
+            }
+        return {
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+            "speed": round(self._speed, 2),
+        }
+
+    async def voice_for(self, voice: VoiceId) -> str:
+        """The ElevenLabs voice ID to speak with.
+
+        In order: a real ID on the VoiceId, an ID pinned in the environment,
+        one discovered from the account, and finally whatever the account's
+        first voice is - because a voice with the wrong accent still says the
+        sentence, and no voice says nothing.
+        """
+        if _is_elevenlabs_id(voice.name):
+            return voice.name
+
+        language = (getattr(voice, "language", None) or "en").split("-")[0].lower()
+        pinned = os.environ.get(f"ELEVEN_{language.upper()}_VOICE_ID") or (
+            os.environ.get("ELEVENLABS_VOICE_ID") if language == "en" else None
+        )
+        if pinned:
+            return pinned
+        if language in self._discovered:
+            return self._discovered[language]
+
+        found = await self._discover(language)
+        if not found:
+            raise ProviderMisconfigured(
+                f"no ElevenLabs voice available for {language!r}; set "
+                f"ELEVEN_{language.upper()}_VOICE_ID in .env "
+                f"(run tools/check_voices.py to list them)"
+            )
+        self._discovered[language] = found
+        return found
+
+    async def _discover(self, language: str) -> str:
+        """Ask the account what voices it has and pick the best fit."""
+        try:
+            import aiohttp
+        except ImportError as exc:
+            raise ProviderMisconfigured("pip install aiohttp") from exc
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_s)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    "https://api.elevenlabs.io/v2/voices?page_size=100",
+                    headers={"xi-api-key": self.api_key},
+                ) as resp:
+                    if resp.status == 401:
+                        raise ProviderMisconfigured("ElevenLabs key rejected")
+                    if resp.status >= 400:
+                        return ""
+                    data = await resp.json()
+        except ProviderMisconfigured:
+            raise
+        except Exception:
+            return ""
+
+        voices = data.get("voices") or []
+        if not voices:
+            return ""
+        if language.startswith("ur"):
+            for entry in voices:
+                haystack = " ".join(
+                    str(part).lower()
+                    for part in (
+                        entry.get("name", ""),
+                        entry.get("description", ""),
+                        *(entry.get("labels") or {}).values(),
+                        *(entry.get("verified_languages") or []),
+                    )
+                )
+                if any(hint in haystack for hint in SOUTH_ASIAN_HINTS):
+                    return entry.get("voice_id", "")
+        return voices[0].get("voice_id", "")
+
+    # ------------------------------------------------------------------
 
     async def synthesize(  # pragma: no cover - network path
         self, text: str, voice: VoiceId
@@ -276,21 +482,34 @@ class ElevenLabsTextToSpeech(SpeedHint, TextToSpeech):
         except ImportError as exc:
             raise ProviderMisconfigured("pip install aiohttp") from exc
 
+        language = (getattr(voice, "language", None) or "en").lower()
+        model_id = self.model_for(language)
+        voice_id = await self.voice_for(voice)
+        line = speakable(text, language=language)
+        if not line:
+            return
+
         url = (
-            f"https://api.elevenlabs.io/v1/text-to-speech/{voice.name}/stream"
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
             f"?output_format=pcm_{self.rate}"
         )
         headers = {"xi-api-key": self.api_key, "Content-Type": "application/json"}
         payload = {
-            "text": speakable(text),
-            "model_id": self.model,
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75,
-                "speed": round(self._speed, 2),
-            },
+            "text": line,
+            "model_id": model_id,
+            "voice_settings": self.settings_for(model_id),
         }
-        timeout = aiohttp.ClientTimeout(total=self.timeout_s)
+        # NOT `total`. This is a STREAMED response: total bounds the whole
+        # download, so a six-second cap means any utterance that takes longer
+        # than six seconds to stream is killed mid-sentence - after chunks have
+        # already been emitted, which is worse than failing outright because
+        # the cascade's Edge fallback only triggers when nothing was emitted.
+        # Observed as, verbatim, "ElevenLabs TTS failed:" with no message,
+        # because asyncio.TimeoutError stringifies to nothing at all.
+        # connect + sock_read bound the things that can actually hang.
+        timeout = aiohttp.ClientTimeout(
+            total=None, connect=self.timeout_s, sock_read=self.timeout_s
+        )
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -301,7 +520,8 @@ class ElevenLabsTextToSpeech(SpeedHint, TextToSpeech):
                         raise ProviderMisconfigured("ElevenLabs key rejected")
                     if resp.status >= 400:
                         raise ProviderUnavailable(
-                            f"ElevenLabs {resp.status}: {await resp.text()}"
+                            f"ElevenLabs {resp.status} ({model_id}, {language}): "
+                            f"{await resp.text()}"
                         )
                     tail = b""
                     async for raw in resp.content.iter_chunked(4096):
@@ -318,10 +538,89 @@ class ElevenLabsTextToSpeech(SpeedHint, TextToSpeech):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            raise ProviderUnavailable(f"ElevenLabs TTS failed: {exc}") from exc
+            # The type, always. An exception whose str() is empty - a timeout,
+            # a dropped payload - otherwise reaches the console as
+            # "ElevenLabs TTS failed:" and says nothing about what went wrong.
+            raise ProviderUnavailable(
+                f"ElevenLabs TTS failed: {type(exc).__name__}: {exc}"
+                f" (model {model_id}, voice {voice_id})"
+            ) from exc
 
 
 # ----------------------------------------------------------------------
+
+
+class FallbackTextToSpeech(SpeedHint, TextToSpeech):
+    """One voice, with another one behind it.
+
+    The incoming direction had no safety net: if synthesis failed, the
+    listener got silence and a warning in a window they are not looking at,
+    which is the failure mode the spec calls out as the worst one available.
+    Now a paid voice that is down, out of quota, or refusing a language falls
+    through to the free one MID-UTTERANCE - as long as nothing has been
+    emitted yet, because a sentence half in one voice and half in another is
+    worse than either.
+    """
+
+    name = "fallback-tts"
+
+    def __init__(self, primary: TextToSpeech, backup: TextToSpeech,
+                 on_notice=None) -> None:
+        self.primary = primary
+        self.backup = backup
+        self.on_notice = on_notice
+        self._demoted = False
+
+    @property
+    def active(self) -> TextToSpeech:
+        return self.backup if self._demoted else self.primary
+
+    def set_speed(self, factor: float) -> float:
+        for engine in (self.primary, self.backup):
+            if getattr(engine, "supports_speed", False):
+                with contextlib.suppress(Exception):
+                    engine.set_speed(factor)
+        return super().set_speed(factor)
+
+    async def synthesize(self, text: str, voice: VoiceId) -> AsyncIterator[PcmChunk]:
+        if not self._demoted:
+            emitted = False
+            try:
+                async for chunk in self.primary.synthesize(text, voice):
+                    emitted = emitted or chunk.pcm.size > 0
+                    yield chunk
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if emitted:
+                    raise
+                self._demoted = True
+                if self.on_notice:
+                    with contextlib.suppress(Exception):
+                        self.on_notice(
+                            f"{getattr(self.primary, 'name', 'the paid voice')} "
+                            f"is unavailable ({exc}); using the free voice."
+                        )
+
+        # The backup speaks the platform's own voice name, not an ID.
+        backup_voice = VoiceId(
+            vendor=getattr(self.backup, "name", "edge"),
+            name=(
+                voice.name
+                if not _is_elevenlabs_id(voice.name)
+                else (
+                    DEFAULT_URDU_EDGE_VOICE
+                    if (voice.language or "ur").startswith("ur")
+                    else DEFAULT_ENGLISH_EDGE_VOICE
+                )
+            ),
+            rate=voice.rate,
+            style=voice.style,
+            language=voice.language,
+        )
+        async for chunk in self.backup.synthesize(text, backup_voice):
+            yield chunk
 
 
 class NullTextToSpeech(TextToSpeech):
@@ -443,12 +742,18 @@ class EdgeTextToSpeech(SpeedHint, TextToSpeech):
     ) -> AsyncIterator[PcmChunk]:
         if not text.strip():
             return
+        language = (getattr(voice, "language", None) or "ur").lower()
+        default_voice = (
+            DEFAULT_ENGLISH_EDGE_VOICE
+            if not language.startswith("ur")
+            else DEFAULT_URDU_EDGE_VOICE
+        )
         voice_name = (
             voice.name
             if (voice and voice.name and voice.name != "azure")
-            else "ur-PK-UzmaNeural"
+            else default_voice
         )
-        line = speakable(text)
+        line = speakable(text, language=language)
         if not line:
             return
         try:

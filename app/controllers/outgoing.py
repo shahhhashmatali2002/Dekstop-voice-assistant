@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 
 import numpy as np
 
@@ -32,6 +33,17 @@ from app.providers.base import (
 )
 from app.models.telemetry import Direction, MetricsBus, TraceFactory, now
 from app.controllers.vad import SpeechEvent, VoiceActivityGate
+
+#: What we tell the speech-to-speech provider we are speaking.
+#:
+#: "ur" is the DEFAULT and it is a compromise, not a claim: it is what this
+#: pipeline was tuned and tested against. Setting OUTGOING_LANGUAGE=auto turns
+#: on the two-recogniser referee in app/providers/dual_asr, which is the right
+#: answer for a speaker who uses Urdu and English in the same call - but it
+#: opens a second recognition stream and adds a settle window per utterance,
+#: so it is opt-in until it has been measured on a real call rather than
+#: assumed. See tools/bench_language.py.
+SOURCE_LANGUAGE = (os.environ.get("OUTGOING_LANGUAGE") or "ur").strip().lower()
 
 #: §7.3 - short acknowledgement tokens in both languages. Translating each one
 #: into a spoken interruption makes a meeting unusable.
@@ -118,8 +130,11 @@ class OutgoingPipeline:
     async def start(self) -> None:
         if self._running:
             return
+        # "auto", not "ur". This speaker uses Urdu and English, separately
+        # and mixed, and pinning the recogniser to one of them was what turned
+        # "I am John Wick" into "John Bek". See app/providers/dual_asr.
         cfg = S2stConfig(
-            source_language="ur", target_language="en", rate=RATE_S2ST
+            source_language=SOURCE_LANGUAGE, target_language="en", rate=RATE_S2ST
         )
         self._stream = await self.s2st.open(cfg)
         self._running = True
@@ -191,7 +206,9 @@ class OutgoingPipeline:
         if self._stream is not None:
             with contextlib.suppress(Exception):
                 await self._stream.aclose()
-        cfg = S2stConfig(source_language="ur", target_language="en", rate=RATE_S2ST)
+        cfg = S2stConfig(
+            source_language=SOURCE_LANGUAGE, target_language="en", rate=RATE_S2ST
+        )
         self._stream = await self.s2st.open(cfg)
         for t in self._tasks[1:]:
             t.cancel()
