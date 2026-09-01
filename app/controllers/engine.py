@@ -482,6 +482,17 @@ class Engine:
                         )
                 if self._incoming is not None and self._incoming.running:
                     raw = teams.ring.read_available()
+                    if raw.size and self._incoming_echo_guarded():
+                        # The capture is hearing OUR OWN Urdu (a Voicemeeter
+                        # strip looping the microphone or the default output
+                        # back into the source bus). Recognising it produces
+                        # garbage [client] text that gets translated and
+                        # spoken, which is heard again, and so on. Silence of
+                        # the same length keeps the stream alive.
+                        self._echo_muted_samples += int(
+                            raw.size / max(1, teams.channels)
+                        )
+                        raw = np.zeros_like(raw)
                     if raw.size:
                         self._incoming.feed(
                             convert.endpoint_to_pipeline(
@@ -594,6 +605,32 @@ class Engine:
             ))
         self._said_why = True
 
+    #: Incoming audio zeroed by the echo guard, for the periodic report.
+    _echo_muted_samples = 0
+    _echo_reported_at = 0.0
+
+    def _incoming_echo_guarded(self) -> bool:
+        """Ignore the incoming capture while our own Urdu is sounding.
+
+        OFF by default, and that is not timidity: on a correctly routed
+        setup the client's audio has no path back into our capture, and the
+        client may legitimately talk over the translation - muting their
+        words for our playback would drop real speech constantly.
+
+        INCOMING_ECHO_GUARD=1 turns it on for setups where the capture
+        DEMONSTRABLY hears our own output - the tell is junk [client] lines
+        appearing in the transcript at the same moment the Urdu voice is
+        speaking. The real fix is the routing (only the meeting app's audio
+        should feed the source bus; the microphone strip must not), but the
+        guard makes the app usable while the mixer is being sorted out.
+        """
+        if os.environ.get("INCOMING_ECHO_GUARD", "").strip().lower() not in (
+            "1", "true", "on", "yes",
+        ):
+            return False
+        pipe = self._incoming
+        return bool(pipe is not None and getattr(pipe, "is_speaking", False))
+
     def _muted_by_playback(self) -> bool:
         """Should the microphone be ignored because we are speaking?
 
@@ -684,6 +721,20 @@ class Engine:
     _muted_reported_at = 0.0
 
     def _report_muted(self) -> None:
+        if self._echo_muted_samples:
+            teams = self.ports.teams_source
+            rate = getattr(teams, "rate", 0) or 48_000
+            seconds = self._echo_muted_samples / rate
+            if seconds >= 1.0 and now() - self._echo_reported_at >= 10.0:
+                self._echo_muted_samples = 0
+                self._echo_reported_at = now()
+                print(
+                    f"[DEBUG INCOMING] echo guard ignored {seconds:.1f}s of "
+                    f"incoming audio while our own Urdu was playing "
+                    f"(INCOMING_ECHO_GUARD=1) - fix the Voicemeeter routing "
+                    f"to remove the loop, then turn this off",
+                    flush=True,
+                )
         if not self._muted_samples:
             return
         mic = self.ports.mic_source

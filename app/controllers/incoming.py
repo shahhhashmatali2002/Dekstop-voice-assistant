@@ -820,8 +820,17 @@ class IncomingPipeline:
 
     @property
     def is_speaking(self) -> bool:
-        """Is Urdu audible in the room right now (or about to be)?"""
-        return now() < self.speaking_until
+        """Is Urdu audible in the room right now (or about to be)?
+
+        Two signals, not one, because `speaking_until` alone had GAPS: it is
+        stamped when a block is written to the sink, so between blocks of one
+        utterance - a slow TTS chunk, a full ring - it could lapse for a
+        moment while Urdu was audibly still playing. In that moment the
+        half-duplex gate opened, the microphone heard the loudspeaker, and
+        the barge-in handler ducked and then FLUSHED our own sentence
+        mid-word. The queue depth covers exactly those gaps: audio waiting
+        to be played is audio about to be heard."""
+        return now() < self.speaking_until or self._queue_ms() > 1.0
 
     def duck(self, on: bool) -> None:
         """Barge-in step 1: attenuate immediately, reversibly (§7.2)."""
