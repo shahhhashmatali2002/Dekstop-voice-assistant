@@ -88,7 +88,13 @@ class OutgoingPipeline:
         self.suppress_backchannels = suppress_backchannels
 
         self.context = RollingContext()
-        self._audio_in: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=100)
+        # Deep enough that continuous speech never overflows it. At ~20 ms
+        # a frame this is ~40 s of audio held before the last-resort drop -
+        # the pump empties it into the recogniser far faster than it fills,
+        # so it only ever backs up while the event loop is blocked, and
+        # dropping a reader's words mid-paragraph (the old maxsize=100, ~2 s)
+        # was heard as "it missed some lines."
+        self._audio_in: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=2000)
         self._stream = None
         self._tasks: list[asyncio.Task] = []
         self._trace = None
@@ -306,7 +312,9 @@ class OutgoingPipeline:
                     self._trace.mark("tts_first_chunk")
                 pcm = chunk.pcm
                 if chunk.rate != self.sink.rate:
-                    pcm = convert.resample(pcm, chunk.rate, self.sink.rate)
+                    pcm = await asyncio.to_thread(
+                        convert.resample, pcm, chunk.rate, self.sink.rate
+                    )
                 if getattr(self.sink, "channels", 1) > 1:
                     pcm = convert.to_channels(pcm, self.sink.channels)
                 await self._write_paced(pcm)

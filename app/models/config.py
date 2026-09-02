@@ -63,7 +63,19 @@ class ProviderConfig:
     #: clone is measured on this machine and, if it cannot keep up, the cheap
     #: pitch-and-tone match takes over - and that runs anywhere. Only the
     #: Urdu the user hears is affected; what the client hears is untouched.
-    clone_voice: bool = True
+    #: OFF by default. The full kNN-VC clone loads a 315M-parameter model
+    #: (WavLM) whose load holds Python's lock long enough to stall the
+    #: asyncio loop, and a stalled loop misses the recogniser's websocket
+    #: keepalive - Deepgram then closes with a ping timeout and recognition
+    #: dies with no transcripts, the exact "it stopped listening" failure
+    #: seen repeatedly on this machine. It also measured at 4.3s of compute
+    #: per second of audio here, far too slow to keep up on a live call. Turn
+    #: it on with VoiceAssistant settings (or CLONE_VOICE=1) only for offline
+    #: use via pretranslate.py, which prepares everything before playback.
+    clone_voice: bool = (
+        __import__("os").environ.get("CLONE_VOICE", "").strip().lower()
+        in ("1", "true", "on", "yes")
+    )
     clone_backend: str = "knn"
 
     #: The most compute per second of audio that may be spent converting before

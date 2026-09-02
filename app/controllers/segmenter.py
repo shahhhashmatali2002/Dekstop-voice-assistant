@@ -320,6 +320,16 @@ class Segmenter:
         units: list[Unit] = []
         text = hyp.text.strip()
 
+        # An EMPTY final is Deepgram's UtteranceEnd event (a word-gap close,
+        # see utterance_end_ms): it carries no transcript of its own and
+        # means "the clause you have been hearing is finished." Flush what is
+        # held rather than treating the empty text as a real final, which
+        # would emit nothing and could drop the clause. This is what makes
+        # reading a paragraph work - the closes arrive on natural word gaps,
+        # not only on silences a fluent reader never leaves.
+        if hyp.is_final and not text:
+            return self.flush("utterance_end")
+
         # Rule (a): the recogniser says this is final. Emit the remainder and
         # reset - nothing more is coming for this utterance.
         if hyp.is_final:

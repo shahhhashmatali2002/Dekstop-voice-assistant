@@ -114,7 +114,13 @@ class IncomingPipeline:
         self._clone_probe: asyncio.Task | None = None
 
         self.context = RollingContext()
-        self._audio_in: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=100)
+        # Deep enough that continuous speech never overflows it. At ~20 ms
+        # a frame this is ~40 s of audio held before the last-resort drop -
+        # the pump empties it into the recogniser far faster than it fills,
+        # so it only ever backs up while the event loop is blocked, and
+        # dropping a reader's words mid-paragraph (the old maxsize=100, ~2 s)
+        # was heard as "it missed some lines."
+        self._audio_in: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=2000)
         self._play_q: asyncio.Queue["_PlayItem"] = asyncio.Queue()
         self._units: asyncio.Queue = asyncio.Queue(maxsize=32)
         #: Units whose translation is already in flight, in speaking order.

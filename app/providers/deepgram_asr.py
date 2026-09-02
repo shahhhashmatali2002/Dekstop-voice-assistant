@@ -100,6 +100,22 @@ class DeepgramAsrStream(AsrStream):
                         raise ProviderRateLimited(detail)
                     raise ProviderUnavailable(detail)
 
+                # UtteranceEnd fires on a word-gap (see utterance_end_ms),
+                # even when no silence tripped normal endpointing - the
+                # signal that a fluent reader has finished a clause. Forward
+                # it as a final marker so the segmenter flushes what it holds
+                # instead of waiting for a pause that never comes. It carries
+                # no transcript of its own; the text is whatever the last
+                # interim confirmed.
+                if msg.get("type") == "UtteranceEnd":
+                    await self._put(
+                        TranscriptDelta(
+                            text="", is_final=True,
+                            language=self._language or None,
+                        )
+                    )
+                    continue
+
                 channel = msg.get("channel") or {}
                 alts = channel.get("alternatives") or []
                 if not alts:
@@ -199,13 +215,37 @@ class DeepgramSpeechToText(SpeechToText):
             # that contain the figures a client call is about. no_delay
             # trades the formatting of a partially-heard entity away for
             # transcripts that arrive when the words were said.
-            "no_delay": "true",
             # How much silence ends an utterance (speech_final). Tunable
             # because it trades against the VAD hangover, which fires our own
             # flush at vad_hangover_ms - the two should stay in the same
             # region or one of them is dead weight.
             "endpointing": os.environ.get("DEEPGRAM_ENDPOINTING", "300"),
         }
+        # OPT-IN extras, OFF by default. These touch the wire protocol and a
+        # bad combination makes Deepgram close the connection, which reads as
+        # "it stopped listening" - so they are only added when explicitly
+        # asked for, and can be turned on one at a time to test on a live
+        # call rather than blind.
+        #
+        #   DEEPGRAM_NO_DELAY=1          - stop smart_format holding finals
+        #                                  back up to 3 s for entity formatting
+        #   DEEPGRAM_UTTERANCE_END_MS=1000 - close a clause on a word-gap, not
+        #                                  only on silence (the paragraph fix);
+        #                                  also turns on vad_events, which it
+        #                                  requires
+        def _on(name: str) -> bool:
+            return (os.environ.get(name) or "").strip().lower() in (
+                "1", "true", "on", "yes",
+            )
+
+        extras = {}
+        if _on("DEEPGRAM_NO_DELAY"):
+            extras["no_delay"] = "true"
+        uend = (os.environ.get("DEEPGRAM_UTTERANCE_END_MS") or "").strip()
+        if uend and uend not in ("0", "off", "false"):
+            extras["utterance_end_ms"] = uend
+            extras["vad_events"] = "true"
+        params.update(extras)
         query = urlencode(params)
         # Keyterms repeat as separate parameters (§7.7). The cap is Deepgram's
         # and it is counted in TOKENS across the whole list - 500 - not in

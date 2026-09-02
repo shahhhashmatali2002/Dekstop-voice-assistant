@@ -173,8 +173,21 @@ class Engine:
             self.ports.wires.stop()
 
     def _warm_clone(self) -> None:
-        """Import torch and load the clone model before any call is live."""
+        """Import torch and load the clone model before any call is live.
+
+        Gated on CLONE_VOICE exactly like the pipeline's own clone (see
+        app/providers/factory.build_voice_clone). This check was MISSING and
+        it was the bug that kept WavLM loading after clone was disabled: the
+        pipeline correctly skipped it, but this warm-up thread loaded 315M
+        parameters anyway, froze the event loop, and killed the recogniser
+        stream - the "83s of audio, 0 results" dead stretch in the logs.
+        """
         try:
+            import os as _os
+            if (_os.environ.get("CLONE_VOICE") or "").strip().lower() not in (
+                "1", "true", "on", "yes",
+            ):
+                return
             p = self.config.providers
             if not getattr(p, "clone_voice", False):
                 return

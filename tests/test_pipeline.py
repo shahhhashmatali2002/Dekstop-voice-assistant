@@ -584,3 +584,19 @@ def test_a_revision_still_holds_everything_back_until_it_settles():
     s.update("I think we should change", 0.0)
     s.update("I think we should change", 0.5)
     assert s.update("I think we should charge", 0.6) == ""
+
+
+def test_utterance_end_event_flushes_held_clause():
+    """Deepgram's UtteranceEnd arrives as an empty final. It must flush the
+    clause the recogniser has been building - the fix for reading a
+    paragraph, where no silence ever trips normal endpointing."""
+    seg = Segmenter(min_hypotheses=1, stable_ms=999_999, max_words=99)
+    seg.push(Hypothesis("reading a long sentence with no pause", at=0.0))
+    seg.push(Hypothesis("reading a long sentence with no pause at all", at=0.2))
+    # No hard punctuation, stable_ms never elapses, max_words not hit - the
+    # old code would have emitted nothing until a silence. The empty final
+    # (UtteranceEnd) must flush what is held.
+    units = seg.push(Hypothesis("", is_final=True, at=0.4))
+    assert units, "UtteranceEnd must flush the held clause"
+    assert "reading a long sentence" in units[0].text
+    assert units[0].reason == "utterance_end"

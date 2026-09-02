@@ -183,6 +183,46 @@ in the app's. The English has to be rendered somewhere you are not listening.
 ---
 ## How to run
 
+### Recommended for a live client call
+
+Type these in the **same** cmd window, in this order, then run the app. The
+two `set` lines apply only to that window — reopen cmd and you must set them
+again.
+
+```powershell
+set OUTGOING_LANGUAGE=auto
+set HALF_DUPLEX=0
+python run.py --allow-capture
+```
+
+- `OUTGOING_LANGUAGE=auto` — listen to YOU with both an Urdu and an English
+  recogniser at once and pick the better one per sentence. Use this whenever
+  you mix Urdu and English in a call, so English names ("John Wick") are not
+  mangled by the Urdu model into nonsense ("Kumchan"). Costs a second
+  recognition stream. Leave it unset to force Urdu only.
+- `HALF_DUPLEX=0` — never mute your microphone while the Urdu plays. Use this
+  ONLY on headphones. On open speakers leave it ON (do not set it), or the app
+  hears its own output and loops.
+- `--allow-capture` — a testing flag that lets the app's windows appear in
+  screen shares. Fine for testing; leave it off for a real call.
+
+Confirm at startup that there is **no** `WavLM-Large loaded` line. If you see
+it, voice clone is loading and will stall recognition — it is off by default;
+turn it back on only with `set CLONE_VOICE=1` for offline use.
+
+### Environment variables (all optional)
+
+| Variable | Default | What it does |
+|---|---|---|
+| `OUTGOING_LANGUAGE` | `ur` | `auto` runs dual Urdu+English recognition on your voice (best for code-switching). |
+| `HALF_DUPLEX` | on | `0` stops your mic being muted during playback. Headphones only. |
+| `CLONE_VOICE` | off | `1` speaks the client's Urdu in the source speaker's voice. Needs a GPU; too slow on most laptops and can stall recognition. Offline use (`pretranslate.py`) only. |
+| `DEEPGRAM_ENDPOINTING` | `300` | Milliseconds of silence that ends an utterance. Lower = snappier, more fragments. |
+| `DEEPGRAM_UTTERANCE_END_MS` | off | e.g. `1000` — also close a clause on a word-gap, not only on silence. Helps when reading a paragraph with no pauses. |
+| `DEEPGRAM_NO_DELAY` | off | `1` stops smart-formatting holding finals back up to 3s. |
+| `KEYTERMS_ALL_LANGUAGES` | off | `1` sends keyterm hints to the Urdu model too (measured to HURT Urdu names — leave off). |
+| `MIC_GAIN` | `2.0` | Multiplier on your microphone level before recognition. |
+
 ### Watching a video, or listening to a call — one way
 
 ```powershell

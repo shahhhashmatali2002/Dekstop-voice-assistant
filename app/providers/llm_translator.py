@@ -147,11 +147,14 @@ class LlmTranslator(Translator):
         api_key: str | None = None,
         model: str = "gpt-4o-mini",
         base_url: str | None = None,
-        # The deadline is part of the latency budget, not just a hang guard:
-        # with translations running ahead of playback, one stuck call holds
-        # the speaking order hostage for its whole timeout. Eight seconds is
-        # already far beyond anything a listener will wait through.
-        timeout_s: float = 8.0,
+        # Raised from 8s to 20s. With the event loop no longer frozen by the
+        # clone model, translations complete in one to three seconds - but an
+        # 8s ceiling was still being hit constantly and DROPPING the
+        # speaker's sentences, which is the worst outcome: the client simply
+        # never hears that line. Late is recoverable, dropped is not. The
+        # drift controller still shortens or drops when playback falls far
+        # behind; this deadline exists only to break a genuinely stuck call.
+        timeout_s: float = 20.0,
         max_output_tokens: int = 300,
         retry_truncated: bool = True,
     ) -> None:

@@ -759,7 +759,12 @@ class EdgeTextToSpeech(SpeedHint, TextToSpeech):
                     continue
                 decoded_at = len(mp3)
                 try:
-                    samples = self._decode(mp3)
+                    # OFF THE EVENT LOOP. miniaudio.decode is a synchronous C
+                    # call; run inline it froze the asyncio loop for seconds
+                    # on a long line, which stalled translation and dropped
+                    # the recogniser's websocket keepalive (NET-0001). A
+                    # thread keeps the loop free to pump audio and keepalives.
+                    samples = await asyncio.to_thread(self._decode, mp3)
                 except Exception:
                     continue  # not a frame boundary yet; wait for more
                 safe = max(0, samples.size - self.TAIL_GUARD)
@@ -769,7 +774,7 @@ class EdgeTextToSpeech(SpeedHint, TextToSpeech):
 
             if not mp3:
                 return
-            samples = self._decode(mp3)
+            samples = await asyncio.to_thread(self._decode, mp3)
             if samples.size > emitted:
                 yield PcmChunk(samples[emitted:].copy(), self.rate)
             yield PcmChunk(np.empty(0, dtype=DTYPE), self.rate, final=True)

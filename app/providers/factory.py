@@ -234,6 +234,20 @@ def build_voice_clone(config, *, on_notice=None):
     from app.providers.voice_clone import VoiceLearner, build_converter
 
     p = config.providers
+    # HARD OFF unless CLONE_VOICE=1 is explicitly set in the environment.
+    # This deliberately IGNORES a saved settings.json that still has clone
+    # enabled: the 315M-parameter WavLM load stalls the asyncio loop, the
+    # recogniser's keepalive is missed, and Deepgram drops the stream - the
+    # "listens a few words then stops" failure on this machine. The kill
+    # switch lives here, not only in the default, so an old saved setting
+    # cannot resurrect it. Turn it on for OFFLINE use (pretranslate.py) with
+    # CLONE_VOICE=1.
+    import os as _os
+    forced_on = (_os.environ.get("CLONE_VOICE") or "").strip().lower() in (
+        "1", "true", "on", "yes",
+    )
+    if not forced_on:
+        return None, None
     if not getattr(p, "clone_voice", False):
         return None, None
 
