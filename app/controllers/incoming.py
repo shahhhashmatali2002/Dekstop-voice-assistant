@@ -138,6 +138,15 @@ class IncomingPipeline:
         self.speech_ms = 0.0       # of that, what the gate called speech
         self.hypotheses = 0        # what the recogniser sent back
         self.units = 0             # phrases confirmed and sent to translate
+        #: Dead-stream detection for the client -> you direction. Deepgram
+        #: can go silently dead - the socket lives but no results come - and
+        #: waiting for its ping timeout to notice was measured at up to forty
+        #: seconds, seen by the user as "Incoming translation stopped". These
+        #: let the pump force a reopen after a few seconds of speech with
+        #: nothing back.
+        self._loud_ms_since_result = 0.0
+        self._last_result_at = now()
+        self._force_reopen = False
 
     # ------------------------------------------------------------------
 
@@ -260,6 +269,9 @@ class IncomingPipeline:
                     self._speaking_trace.mark("frame_sent")
 
 
+                if res.speech:
+                    self._loud_ms_since_result += 1000.0 * frame.size / RATE_ASR
+
                 if self._stream is not None:
                     try:
                         await self._stream.push_audio(frame)
@@ -271,6 +283,25 @@ class IncomingPipeline:
                         # reconnect is about to be able to use.
                         pass
 
+                # Seconds of SPEECH sent, nothing back: the stream is dead
+                # whatever the socket claims. Close it so the consumer's
+                # async-for ends and reopens, rather than blocking on results
+                # that will never come.
+                if (
+                    self._stream is not None
+                    and self._loud_ms_since_result > 5000.0
+                    and now() - self._last_result_at > 15.0
+                ):
+                    print(
+                        "[DEBUG INCOMING] speech sent for 15s with nothing "
+                        "back - the recogniser is dead, reopening now",
+                        flush=True,
+                    )
+                    self._loud_ms_since_result = 0.0
+                    self._last_result_at = now()
+                    self._force_reopen = True
+                    with contextlib.suppress(Exception):
+                        await self._stream.aclose()
 
                 if res.event is SpeechEvent.OFFSET:
                     for unit in self.segmenter.flush():
@@ -280,7 +311,7 @@ class IncomingPipeline:
     #: original audio. A dropped websocket is ordinary - a laptop sleeping, a
     #: wifi handover, a provider restarting one node - and ending the session
     #: for one is a worse answer than waiting a second and dialling again.
-    RECONNECT_ATTEMPTS = 3
+    RECONNECT_ATTEMPTS = 6
 
     async def _consume_hypotheses(self) -> None:
         """Read hypotheses, and own the lifetime of the connection.
@@ -298,6 +329,8 @@ class IncomingPipeline:
                     break
                 async for hyp in self._stream.hypotheses():
                     failures = 0
+                    self._loud_ms_since_result = 0.0
+                    self._last_result_at = now()
                     self.hypotheses += 1
                     if self._speaking_trace and not self._speaking_trace.t_hypothesis:
                         self._speaking_trace.mark("hypothesis")
@@ -316,6 +349,14 @@ class IncomingPipeline:
             if not self._running:
                 return
 
+            if self._force_reopen:
+                # The pump closed a silently-dead stream on purpose. Reopen
+                # without spending a failure - the stream did not fault, it
+                # went quiet, and a healthy redial is expected to succeed.
+                self._force_reopen = False
+                if await self._reopen(1):
+                    continue
+
             failures += 1
             if failures > self.RECONNECT_ATTEMPTS or not await self._reopen(failures):
                 await self._degrade(f"recognition stream: {reason}")
@@ -323,7 +364,7 @@ class IncomingPipeline:
 
     async def _reopen(self, attempt: int) -> bool:
         """Dial the recogniser again. False when it will not answer."""
-        await asyncio.sleep(min(2.0, 0.3 * attempt))
+        await asyncio.sleep(min(4.0, 0.4 * attempt))
         old, self._stream = self._stream, None
         if old is not None:
             with contextlib.suppress(Exception):
@@ -820,16 +861,30 @@ class IncomingPipeline:
 
     @property
     def is_speaking(self) -> bool:
-        """Is Urdu audible in the room right now (or about to be)?
+        """Is Urdu AUDIBLE in the room right now (or within its tail)?
 
-        Two signals, not one, because `speaking_until` alone had GAPS: it is
-        stamped when a block is written to the sink, so between blocks of one
-        utterance - a slow TTS chunk, a full ring - it could lapse for a
-        moment while Urdu was audibly still playing. In that moment the
-        half-duplex gate opened, the microphone heard the loudspeaker, and
-        the barge-in handler ducked and then FLUSHED our own sentence
-        mid-word. The queue depth covers exactly those gaps: audio waiting
-        to be played is audio about to be heard."""
+        This is the half-duplex signal, and it must be TIGHT: every extra
+        moment it stays true is a moment the outgoing direction throws the
+        user's own microphone away. It was watched discarding almost eight
+        seconds in ten, because a broader version stayed true while Urdu was
+        merely QUEUED - and during drift there is always something queued,
+        so the microphone was muted more or less permanently.
+
+        Only actual playback counts here. `speaking_until` is stamped a
+        little past the end of each block that reaches the sink, so it spans
+        one audible utterance without spanning the queue behind it."""
+        return now() < self.speaking_until
+
+    @property
+    def is_speaking_or_pending(self) -> bool:
+        """Urdu audible OR about to be - the barge-in signal.
+
+        Barge-in wants the WIDER window: ducking is instant and reversible,
+        so covering the gaps between blocks of one utterance (a slow TTS
+        chunk, a full ring) costs nothing and stops a real interruption
+        being missed. Kept separate from `is_speaking` so this breadth never
+        leaks into the half-duplex mute, which pays for every extra
+        millisecond in discarded speech."""
         return now() < self.speaking_until or self._queue_ms() > 1.0
 
     def duck(self, on: bool) -> None:

@@ -200,14 +200,38 @@ class OutgoingPipeline:
                             await self._degrade(f"translation stream: {exc}")
                             return
 
+    #: How many times to redial before giving the direction up. One attempt
+    #: was watched failing on a live session: the network hiccup that killed
+    #: the stream also failed the single immediate handshake, and the whole
+    #: outgoing direction died for what was a twenty-second outage.
+    RECONNECT_ATTEMPTS = 5
+
     async def _restart_stream(self) -> None:
         if self._stream is not None:
             with contextlib.suppress(Exception):
                 await self._stream.aclose()
+            self._stream = None
         cfg = S2stConfig(
             source_language=SOURCE_LANGUAGE, target_language="en", rate=RATE_S2ST
         )
-        self._stream = await self.s2st.open(cfg)
+        last: Exception | None = None
+        for attempt in range(1, self.RECONNECT_ATTEMPTS + 1):
+            # 0.5, 1, 2, 4, 8 seconds - long enough for a wifi handover or a
+            # provider node restart, short enough that speech loss is small.
+            await asyncio.sleep(min(8.0, 0.5 * (2 ** (attempt - 1))))
+            try:
+                self._stream = await self.s2st.open(cfg)
+                last = None
+                break
+            except Exception as exc:
+                last = exc
+                print(
+                    f"[DEBUG OUTGOING] reconnect {attempt}/"
+                    f"{self.RECONNECT_ATTEMPTS} failed: {exc}",
+                    flush=True,
+                )
+        if last is not None:
+            raise ProviderError(f"could not reopen the translation stream: {last}")
         for t in self._tasks[1:]:
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

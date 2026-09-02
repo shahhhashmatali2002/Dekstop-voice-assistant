@@ -299,6 +299,17 @@ class Engine:
 
 
     async def _start_translating(self) -> None:
+        # Whatever the capture rings collected BEFORE Start is stale room
+        # noise and old speech. Fed to a recogniser as one burst, it comes
+        # back as a confidently hallucinated first sentence - the session
+        # that opened with "اس کے بعد کے کے" before the first real word was
+        # exactly this. Translation begins NOW; the backlog is dropped.
+        for src in (self.ports.mic_source, self.ports.teams_source):
+            ring = getattr(src, "ring", None)
+            if ring is not None:
+                with contextlib.suppress(Exception):
+                    ring.read_available()
+
         # In a thread, and not awaited. Enumerating endpoints and creating a
         # COM object takes seconds on some machines, and Start has to feel
         # immediate - the routing landing a moment later is invisible, whereas

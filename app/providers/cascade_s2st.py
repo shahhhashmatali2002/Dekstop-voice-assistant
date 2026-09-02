@@ -157,6 +157,15 @@ class CascadeS2stStream(S2stStream):
         self._jobs: set[asyncio.Task] = set()
         self._last_push = 0.0
         self._pushed_ms = 0.0
+        #: Dead-stream detection. `_loud_ms` counts audio loud enough to be
+        #: speech since the last result; a recogniser that is being sent
+        #: seconds of speech and answering nothing is dead whatever the
+        #: socket says, and waiting for the websocket ping timeout to notice
+        #: (up to forty seconds) was measured as "I said hello and the reply
+        #: took a minute".
+        self._loud_ms = 0.0
+        self._last_result_at = time.monotonic()
+        self._force_redial = False
         self._worker = asyncio.create_task(self._read_hypotheses())
         self._heartbeat = asyncio.create_task(self._keep_alive())
 
@@ -174,6 +183,10 @@ class CascadeS2stStream(S2stStream):
             pcm = convert.resample(pcm, self._cfg.rate, RATE_ASR)
         self._last_push = time.monotonic()
         self._pushed_ms += len(pcm) * 1000.0 / RATE_ASR
+        # Mean absolute level ~300 on int16 is a conservative "someone is
+        # talking" bar - silence and room tone stay well under it.
+        if pcm.size and float(np.abs(pcm.astype(np.float32)).mean()) > 300.0:
+            self._loud_ms += len(pcm) * 1000.0 / RATE_ASR
         await self._asr.push_audio(pcm)
 
     #: Deepgram drops a stream after ten seconds with nothing on it. Half that
@@ -192,6 +205,29 @@ class CascadeS2stStream(S2stStream):
             await asyncio.sleep(self.KEEPALIVE_EVERY_S / 2.0)
             if self._closed:
                 return
+
+            # Dead-stream check, every beat: seconds of SPEECH sent, nothing
+            # at all back. Closing the recogniser here ends the reader's
+            # iterator, and `_force_redial` tells it to dial again rather
+            # than treat the end as the session finishing.
+            if (
+                self._asr is not None
+                and self._loud_ms > 5000.0
+                and time.monotonic() - self._last_result_at > 15.0
+            ):
+                print(
+                    "[DEBUG ASR] speech has been going out for 15s with "
+                    "nothing back - the stream is dead, redialling now "
+                    "rather than waiting for the ping timeout",
+                    flush=True,
+                )
+                self._loud_ms = 0.0
+                self._last_result_at = time.monotonic()
+                self._force_redial = True
+                with contextlib.suppress(Exception):
+                    await self._asr.aclose()
+                continue
+
             if time.monotonic() - self._last_push < self.KEEPALIVE_EVERY_S:
                 continue
             # Looked up per beat, not once: after an in-place reopen the
@@ -285,6 +321,8 @@ class CascadeS2stStream(S2stStream):
             try:
               async for hypothesis in self._asr.hypotheses():
                 failures = 0
+                self._last_result_at = time.monotonic()
+                self._loud_ms = 0.0
                 text = (hypothesis.text or "").strip()
 
                 if hypothesis.is_final:
@@ -344,14 +382,15 @@ class CascadeS2stStream(S2stStream):
                 self.failure = exc
 
             # A CLEAN end is the provider (or our own close) saying the
-            # session is over - ending with it is correct. Only an ABNORMAL
-            # end - the recogniser hanging up mid-session, surfaced as an
-            # exception - is worth redialling, keeping the translator, the
-            # synthesis queue and everything downstream: the alternative is
-            # a quiet death discovered only when a push fails, ten lost
-            # seconds later.
-            if self._closed or broke is None:
+            # session is over - ending with it is correct. What earns a
+            # redial: an ABNORMAL end (the recogniser hanging up
+            # mid-session, surfaced as an exception), or the heartbeat's
+            # dead-stream verdict, which closes the stream cleanly on
+            # purpose and raises this flag. Everything downstream - the
+            # translator, the synthesis queue - is kept.
+            if self._closed or (broke is None and not self._force_redial):
                 break
+            self._force_redial = False
             failures += 1
             if failures > self.RECONNECT_ATTEMPTS:
                 break
