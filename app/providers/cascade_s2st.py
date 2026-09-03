@@ -148,11 +148,24 @@ class CascadeS2stStream(S2stStream):
         ):
             from app.controllers.segmenter import Segmenter
 
+            # Tuned for a RATE-LIMITED translator (Gemini free tier). Each
+            # emitted unit is one translation request, and speaking fast on
+            # clause-sized units fired requests faster than the free tier
+            # allows - they came back 429 and the sentences were DROPPED.
+            # Larger, sentence-sized units mean far fewer requests per minute,
+            # which is what actually stops the drops. Override with the env
+            # vars below if you move to a faster translator.
+            import os as _os
+            def _num(name, default):
+                try:
+                    return float(_os.environ.get(name, "") or default)
+                except ValueError:
+                    return default
             self._segmenter = Segmenter(
                 min_hypotheses=2,
-                stable_ms=250.0,
-                max_words=14,
-                soft_min_words=6,
+                stable_ms=_num("CASCADE_STABLE_MS", 500.0),
+                max_words=int(_num("CASCADE_MAX_WORDS", 24)),
+                soft_min_words=int(_num("CASCADE_SOFT_MIN_WORDS", 14)),
             )
         self._jobs: set[asyncio.Task] = set()
         self._last_push = 0.0
