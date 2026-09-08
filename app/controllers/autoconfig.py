@@ -33,8 +33,23 @@ from app.audio.devices import (
 from app.models.config import Config
 
 
+#: Endpoints that exist but are useless as the app\'s cables: VoiceMeeter\'s
+#: numbered insert channels ("Voicemeeter In 1".."In 5") and its 16-channel /
+#: VAIO3 variants. They are real Windows devices, so the old code offered them
+#: as defaults - and picking "Voicemeeter In 1" (which routes to no bus)
+#: silently broke every call. The plainly named inputs ("Voicemeeter Input",
+#: "Voicemeeter AUX Input") and the VB-CABLE endpoints are what actually work.
+import re as _re
+_JUNK_CABLE = _re.compile(r"\b(?:in|out)\s*\d+\b|\b16\s*ch\b|vaio3", _re.I)
+
+
 def virtual_cables(manager: DeviceManager) -> list[str]:
-    """Playback endpoints that are virtual cables, in a stable order."""
+    """Playback endpoints that are virtual cables - the usable ones first.
+
+    The numbered VoiceMeeter insert channels sort last, so a default is never
+    drawn from them while a real cable exists; they remain available so a
+    machine that somehow has only those is not left with nothing.
+    """
     seen: dict[str, None] = {}
     get_devs = getattr(manager, "wasapi_devices", None)
     devices = get_devs() if callable(get_devs) else []
@@ -42,7 +57,8 @@ def virtual_cables(manager: DeviceManager) -> list[str]:
         name = getattr(device, "name", "")
         if getattr(device, "can_render", False) and looks_virtual(name):
             seen.setdefault(name, None)
-    return sorted(seen)
+    # (is-junk, name) - False sorts before True, so real cables come first.
+    return sorted(seen, key=lambda n: (bool(_JUNK_CABLE.search(n)), n))
 
 
 
@@ -137,6 +153,19 @@ def autoconfigure(
                     f"{label}: cleared {saved!r} - no endpoint of that name "
                     f"exists any more"
                 )
+
+    # A previously-saved JUNK cable ("Voicemeeter In 1" etc.) is cleared so
+    # the assignment below can replace it with a real one. It looks
+    # configured but routes nowhere, which is worse than blank.
+    for role in ("virtual_mic", "teams_speaker"):
+        val = getattr(devices, role)
+        if val and _JUNK_CABLE.search(val):
+            setattr(devices, role, "")
+            changed = True
+            notes.append(
+                f"{role.replace('_', ' ')}: cleared {val!r} - a numbered "
+                f"insert channel that routes to no bus"
+            )
 
     # Never offer something audible as a cable: that is the feedback loop.
     cables = [c for c in virtual_cables(manager) if c != devices.headphones]
