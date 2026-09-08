@@ -225,6 +225,42 @@ class Application:
             name = getattr(dev, "name", None)
             print(f"    {role:<28} {name if name else '(none)'}", flush=True)
 
+        # EXACTLY WHAT TO SET IN TEAMS, computed from the devices above and
+        # printed in plain words - so the two Teams dropdowns are never a
+        # guessing game. This is the step people get wrong, because Teams'
+        # own labels ("Voicemeeter Out B1") do not obviously correspond to
+        # the app's ("Voicemeeter AUX Input").
+        vmic_name = getattr(vmic_dev, "name", "") or ""
+        teams_name = getattr(teams_dev, "name", "") or ""
+        low = vmic_name.lower()
+        if "cable" in low:
+            # VB-CABLE: the mic is the CABLE Output paired with CABLE Input.
+            mic_hint = vmic_name.replace("Input", "Output")
+            bus_note = ""
+        elif "voicemeeter" in low:
+            # Voicemeeter: the app plays into a virtual-input STRIP; Teams
+            # must read a B bus (B1/B2) that strip is routed to. A buses are
+            # speakers and never work as a mic.
+            mic_hint = "Voicemeeter Out B1  (a B bus - NOT A1/A2/A3)"
+            bus_note = (
+                "    In the Voicemeeter window, on the "
+                + repr(vmic_name)
+                + " strip, light up the B1 button (green); "
+                "then Teams Microphone = 'Voicemeeter Out B1'."
+            )
+        else:
+            mic_hint = f"the recording/output half of {vmic_name!r}"
+            bus_note = ""
+        print("", flush=True)
+        print("  >>> SET THESE TWO IN TEAMS (Settings > Devices > Audio):", flush=True)
+        print(f"        Teams Speaker    = {teams_name!r}", flush=True)
+        print(f"        Teams Microphone = {mic_hint}", flush=True)
+        print("        Teams Noise suppression = OFF "
+              "(or it mutes the translated voice)", flush=True)
+        if bus_note:
+            print(bus_note, flush=True)
+        print("", flush=True)
+
         phones = RenderSink(dm, phones_dev)
         teams = CaptureSource(dm, teams_lb)
         mic = None if video else CaptureSource(dm, mic_dev)
