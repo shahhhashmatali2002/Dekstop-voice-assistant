@@ -167,6 +167,18 @@ def build_s2st(providers: dict, *, terminology=None):
     """
     import os
 
+    wants_gemini_live = (os.environ.get("USE_GEMINI_LIVE") or "1").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    gemini_key = get_secret("GEMINI_API_KEY")
+    if wants_gemini_live and usable(gemini_key):
+        from app.providers.gemini_live_s2st import GeminiLiveSpeechTranslator
+
+        return GeminiLiveSpeechTranslator(
+            gemini_key,
+            asr=build_outgoing_asr(providers["asr"]),
+        )
+
     wants_realtime = (os.environ.get("USE_REALTIME") or "").strip().lower() in (
         "1", "true", "yes", "on",
     )
