@@ -163,8 +163,8 @@ def test_stream_interrupted():
         # Wait briefly for reader task to process messages
         await asyncio.sleep(0.05)
 
-        # Interruption clears the pending audio queue
-        assert stream._audio.empty()
+        # Interruption preserves the pending audio queue so previous sentences finish speaking
+        assert not stream._audio.empty()
 
         await stream.aclose()
 

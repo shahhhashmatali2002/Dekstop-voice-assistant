@@ -53,101 +53,11 @@ Rules:
 3. Preserve names of people (e.g. Hashmat Ali), companies, and software engineering \
 terminology accurately in English.
 4. Begin speaking the translation immediately without delay.
+5. Translate each sentence spoken by the user sequentially in order. Never skip or drop earlier sentences when the speaker pauses or continues speaking.
 """
 
 
-import re
-
-# Devanagari Unicode range: \u0900 - \u097F
-DEVANAGARI_RE = re.compile(r"[\u0900-\u097f]")
-
-HINDI_URDU_WORDS = {
-    "कैसे": "کیسے",
-    "हैं": "ہیں",
-    "आप": "آپ",
-    "हेलो": "ہیلو",
-    "है": "ہے",
-    "हूं": "ہوں",
-    "हूँ": "ہوں",
-    "मेरा": "میرا",
-    "मेरी": "میری",
-    "मेरे": "میرے",
-    "नाम": "نام",
-    "हस्मत": "حشمت",
-    "हशमत": "حشمت",
-    "अली": "علی",
-    "क्या": "کیا",
-    "हाल": "حال",
-    "चाल": "چال",
-    "ठीक": "ٹھیک",
-    "शुक्रिया": "شکریہ",
-    "अच्छा": "اچھا",
-    "हाँ": "ہاں",
-    "हां": "ہاں",
-    "नहीं": "نہیں",
-    "मेकओवर": "میک اوور",
-    "पाकिस्तान": "پاکستان",
-    "डेवलपर": "ڈویلپر",
-    "काम": "کام",
-    "करता": "کرتا",
-    "करती": "کرتی",
-    "करते": "کرتے",
-    "बात": "بات",
-    "करना": "کرنا",
-    "चाहता": "چاہتا",
-    "चाहती": "چاہتی",
-    "चाहते": "چاہتے",
-    "बहुत": "بہت",
-    "धन्यवाद": "شکریہ",
-    "नमस्ते": "سلام",
-    "नमस्कार": "سلام",
-}
-
-CHAR_MAP = {
-    "अ": "ا", "आ": "آ", "इ": "اِ", "ई": "ای", "उ": "اُ", "ऊ": "او",
-    "ए": "اے", "ऐ": "اے", "ओ": "او", "औ": "او",
-    "क": "ک", "ख": "کھ", "ग": "گ", "घ": "گھ", "ङ": "ن",
-    "च": "چ", "छ": "چھ", "ज": "ج", "झ": "جھ", "ञ": "ن",
-    "ट": "ٹ", "ठ": "ٹھ", "ड": "ڈ", "ढ": "ڈھ", "ण": "ن",
-    "त": "ت", "थ": "تھ", "द": "د", "ध": "دھ", "न": "ن",
-    "प": "پ", "फ": "ف", "ब": "ب", "भ": "بھ", "म": "م",
-    "य": "ی", "र": "ر", "ल": "ل", "व": "و",
-    "श": "ش", "ष": "ش", "स": "س", "ह": "ہ",
-    "क़": "ق", "ख़": "خ", "ग़": "غ", "ज़": "ز", "ड़": "ڑ", "ढ़": "ڑھ", "फ़": "ف",
-    "ा": "ا", "ि": "ِ", "ी": "ی", "ु": "ُ", "ू": "و",
-    "े": "ے", "ै": "ے", "ो": "و", "ौ": "و",
-    "ं": "ں", "ँ": "ں", "्": "", "ः": "ہ", "़": "",
-    "।": "۔",
-}
-
-
-def to_urdu_script(text: str) -> str:
-    """Ensure any South Asian Hindustani text is rendered in Urdu Arabic script."""
-    if not text or not DEVANAGARI_RE.search(text):
-        return text
-
-    tokens = re.split(r"(\s+|[^\w\u0900-\u097f]+)", text)
-    result = []
-    for token in tokens:
-        if token in HINDI_URDU_WORDS:
-            result.append(HINDI_URDU_WORDS[token])
-        elif DEVANAGARI_RE.search(token):
-            out = []
-            i = 0
-            while i < len(token):
-                if i + 1 < len(token) and token[i : i + 2] in CHAR_MAP:
-                    out.append(CHAR_MAP[token[i : i + 2]])
-                    i += 2
-                elif token[i] in CHAR_MAP:
-                    out.append(CHAR_MAP[token[i]])
-                    i += 1
-                else:
-                    out.append(token[i])
-                    i += 1
-            result.append("".join(out))
-        else:
-            result.append(token)
-    return "".join(result)
+from app.providers.urdu_speech import to_urdu_script
 
 
 class GeminiLiveS2stStream(S2stStream):
@@ -244,14 +154,26 @@ class GeminiLiveS2stStream(S2stStream):
 
                 server_content = msg.get("serverContent") or {}
                 
-                # Check for interruption (barge-in)
+                # When Gemini signals an interruption, DO NOT purge audio queue!
+                # All audio generated for previous sentences must finish playing sequentially.
                 if server_content.get("interrupted"):
-                    # Clear pending audio
-                    while not self._audio.empty():
-                        with contextlib.suppress(asyncio.QueueEmpty):
-                            self._audio.get_nowait()
+                    if self._current_output_text.strip() or self._current_input_text.strip():
+                        raw_source = (
+                            self._current_input_text.strip()
+                            or self._last_asr_text.strip()
+                        )
+                        final_source = to_urdu_script(raw_source)
+                        await self._put_text(
+                            TranscriptDelta(
+                                text=self._current_output_text.strip(),
+                                is_final=True,
+                                language="en",
+                                source_text=final_source,
+                            )
+                        )
                     self._current_input_text = ""
                     self._current_output_text = ""
+                    self._last_asr_text = ""
                     continue
 
                 # 1. Real-time transcription from Gemini Live:
@@ -292,8 +214,8 @@ class GeminiLiveS2stStream(S2stStream):
                 if server_content.get("turnComplete"):
                     final_translated = self._current_output_text.strip()
                     raw_source = (
-                        self._last_asr_text.strip()
-                        or self._current_input_text.strip()
+                        self._current_input_text.strip()
+                        or self._last_asr_text.strip()
                     )
                     final_source = to_urdu_script(raw_source)
                     if final_translated or final_source:
@@ -423,6 +345,9 @@ class GeminiLiveSpeechTranslator(SpeechTranslator):
                     "thinkingConfig": {
                         "thinkingBudget": 0,
                     },
+                },
+                "realtimeInputConfig": {
+                    "activityHandling": "NO_INTERRUPTION",
                 },
                 "inputAudioTranscription": {},
                 "outputAudioTranscription": {},

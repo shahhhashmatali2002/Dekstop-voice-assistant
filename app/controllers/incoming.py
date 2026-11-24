@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass, replace
+import os
 
 import numpy as np
 
@@ -124,10 +125,7 @@ class IncomingPipeline:
         self._play_q: asyncio.Queue["_PlayItem"] = asyncio.Queue()
         self._units: asyncio.Queue = asyncio.Queue(maxsize=32)
         #: Units whose translation is already in flight, in speaking order.
-        #: The bound is the lookahead: how many translations may run ahead of
-        #: the mouth. Small on purpose - each one is money and, if the queue
-        #: ever drops units, wasted money.
-        self._ready_q: asyncio.Queue = asyncio.Queue(maxsize=2)
+        self._ready_q: asyncio.Queue = asyncio.Queue(maxsize=32)
         self._queued_ms = 0.0
         self._stream = None
         self._tasks: list[asyncio.Task] = []
@@ -451,7 +449,8 @@ class IncomingPipeline:
             self.metrics.set_queue_depth(Direction.INCOMING, queue_ms)
             self.metrics.set_drift(Direction.INCOMING, decision.rate)
 
-            if decision.drop:
+            allow_drop = os.environ.get("DROP_SENTENCES", "0").lower() in ("1", "true")
+            if decision.drop and allow_drop:
                 # §7.6: dropping always beats growing, and it is never silent.
                 trace.dropped = True
                 trace.drop_reason = (

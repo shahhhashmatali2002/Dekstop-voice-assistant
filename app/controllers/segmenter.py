@@ -450,6 +450,12 @@ class Segmenter:
         if _starts_with(heard, spoken):
             return " ".join(words[len(spoken):]).strip()
 
+        # Check if a suffix of what was already emitted overlaps with the start of heard
+        # Handles cases where ASR dropped initial words on revision (e.g. "I'm in ground software" -> "in ground software technical manager")
+        for k in range(min(len(spoken), len(heard)), 1, -1):
+            if spoken[-k:] == heard[:k]:
+                return " ".join(words[k:]).strip()
+
         shared = 0
         for mine, theirs in zip(spoken, heard):
             if mine != theirs:

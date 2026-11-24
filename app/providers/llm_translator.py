@@ -38,6 +38,7 @@ from app.providers.base import (
     Translator,
 )
 from app.models.terminology import Terminology
+from app.providers.urdu_speech import to_urdu_script
 
 LANGUAGE_NAMES = {
     "en": "English",
@@ -326,6 +327,8 @@ class LlmTranslator(Translator):
                     out = second
 
         out = self._strip_already_spoken(out)
+        if unit.target_language == "ur":
+            out = to_urdu_script(out)
         for piece in SENTENCE_SPLIT.split(out):
             if len(piece.split()) >= 4:
                 self._recent_out.append(_norm_sentence(piece))
